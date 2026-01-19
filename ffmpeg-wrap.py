@@ -373,7 +373,8 @@ class EncoderWorker(QThread):
         # --- Resolution Target ---
         res_map = {
             "2160p (4K)": 2160, "1440p": 1440, "1080p": 1080,
-            "720p": 720, "540p": 540, "480p": 480, "360p": 360
+            "720p": 720, "540p": 540, "480p": 480, "360p": 360,
+            "240p": 240, "144p": 144
         }
         res_str = p.get('res_choice', 'Original')
         target_h = res_map.get(res_str, orig_h)
@@ -445,6 +446,7 @@ class EncoderWorker(QThread):
                     elif video_kbps > 100000:
                         self.log_signal.emit(f"Warning: Calculated bitrate {video_kbps}k is very high, capping at 100000k.")
                         video_kbps = 100000
+                    self.log_signal.emit("⚠ Auto-Scale: Forcing 2-pass encoding for optimal quality at low bitrate")
                 else:
                     self.log_signal.emit(f"Target: {target_mb}MB | Video: {video_kbps}k | Codec: {video_codec_cmd}")
 
@@ -730,7 +732,8 @@ class EncoderWorker(QThread):
 
         # --- Execute ---
         # VP9 supports 2-pass encoding
-        run_2pass = (mode == 'size' and not use_hw and video_codec_cmd != "copy") and p.get('two_pass', False)
+        # Force 2-pass when auto downscale is triggered (forced_av1)
+        run_2pass = (mode == 'size' and not use_hw and video_codec_cmd != "copy") and (p.get('two_pass', False) or forced_av1)
 
         if run_2pass:
             temp_dir = tempfile.gettempdir()
@@ -1099,7 +1102,7 @@ class MainWindow(QMainWindow):
         scale_layout.setContentsMargins(2, 2, 2, 2)
 
         self.res_combo = QComboBox()
-        self.res_options = ["1080p", "Original", "2160p (4K)", "1440p", "720p", "540p", "480p", "360p"]
+        self.res_options = ["1080p", "Original", "2160p (4K)", "1440p", "720p", "540p", "480p", "360p", "240p", "144p"]
         self.res_combo.addItems(self.res_options)
         self.res_combo.setCurrentText("Original")
         scale_layout.addRow("Resolution:", self.res_combo)
