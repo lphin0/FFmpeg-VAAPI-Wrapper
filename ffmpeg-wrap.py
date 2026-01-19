@@ -669,7 +669,33 @@ class EncoderWorker(QThread):
                 video_flags.extend(["-row-mt", "1", "-pix_fmt", "yuv420p"])
         else:
             if use_hw:
-                video_flags.extend(["-compression_level", quality_preset])
+                # Check GPU vendor - VCN compression levels are AMDGPU-specific
+                device = p.get('device', '/dev/dri/renderD128')
+                gpu_vendor = p.get('hw_decoder_caps', {}).get('gpu_vendor', 'unknown')
+                
+                if "h264_vaapi" in video_codec_cmd or "hevc_vaapi" in video_codec_cmd:
+                    if gpu_vendor == 'amd':
+                        # VCN (Video Core Next) compression level mapping for AMDGPU
+                        # Binary flags: VBAQ=16, pre-encode=8, quality=4, balanced=2, speed=0, validity=1
+                        # Map UI preset values to correct VCN compression levels
+                        compression_map = {
+                            1: 29,  # Quality (Best): quality + pre-encode + VBAQ (4+8+16+1)
+                            2: 1,   # Balanced (Default): balanced + pre-encode + VBAQ (AMD recommended)
+                            4: 11,  # Speed (Fast): balanced + pre-encode (2+8+1)
+                            7: 0    # Max Speed: speed preset only
+                        }
+                        try:
+                            preset_val = int(quality_preset)
+                            compression_level = compression_map.get(preset_val, 1)  # Default to balanced (1)
+                            self.log_signal.emit(f"HW Preset: {preset_val} -> VCN compression_level={compression_level}")
+                            video_flags.extend(["-compression_level", str(compression_level)])
+                        except (ValueError, TypeError):
+                            self.log_signal.emit(f"Warning: Invalid quality preset '{quality_preset}', using default")
+                            video_flags.extend(["-compression_level", "1"])
+                    else:
+                        # Intel or other GPU - skip VCN compression levels
+                        # Intel Quick Sync doesn't use the same compression_level parameter
+                        self.log_signal.emit(f"Notice: {gpu_vendor.upper()} GPU detected - VCN compression levels not applied")
             else:
                 presets = ["veryslow", "slower", "slow", "medium", "fast", "faster", "veryfast", "superfast", "ultrafast"]
                 try:
@@ -1432,6 +1458,38 @@ class MainWindow(QMainWindow):
         if device:
             self.probe_device(device)
 
+    def detect_gpu_vendor(self, device_path):
+        """Detect GPU vendor from DRI device path"""
+        try:
+            # Extract device number from path (e.g., /dev/dri/renderD128 -> 128)
+            device_num = device_path.split('renderD')[-1]
+            
+            # Try to read vendor from sysfs
+            vendor_path = f"/sys/class/drm/renderD{device_num}/device/vendor"
+            if os.path.exists(vendor_path):
+                with open(vendor_path, 'r') as f:
+                    vendor_id = f.read().strip()
+                    # Intel vendor ID is 0x8086
+                    if vendor_id.lower() == '0x8086':
+                        return 'intel'
+                    # AMD vendor IDs: 0x1002 (ATI) or 0x1022
+                    elif vendor_id.lower() in ['0x1002', '0x1022']:
+                        return 'amd'
+            
+            # Fallback: try to parse from device name
+            card_path = f"/sys/class/drm/renderD{device_num}"
+            if os.path.exists(card_path):
+                device_link = os.path.realpath(f"{card_path}/device")
+                if 'i915' in device_link.lower():
+                    return 'intel'
+                elif 'amdgpu' in device_link.lower() or 'radeon' in device_link.lower():
+                    return 'amd'
+            
+            return 'unknown'
+        except Exception as e:
+            self.log.append(f"Warning: Could not detect GPU vendor: {e}")
+            return 'unknown'
+
     def probe_device(self, device_path):
         if device_path in self.device_capabilities:
             self.update_codec_ui(self.v_codec.currentText())
@@ -1442,6 +1500,10 @@ class MainWindow(QMainWindow):
         ffmpeg_cmd = ffmpeg_path if ffmpeg_path else 'ffmpeg'
 
         self.log.append(f"Probing device: {device_path} ...")
+        
+        # Detect GPU vendor
+        gpu_vendor = self.detect_gpu_vendor(device_path)
+        self.log.append(f"  -> GPU Vendor: {gpu_vendor.upper()}")
         capabilities = {'av1': False, 'h264': False, 'hevc': False}
         decoder_caps = {'h264': False, 'hevc': False, 'vp8': False, 'vp9': False, 'av1': False, 'mpeg2video': False}
         error_occurred = False
@@ -1524,8 +1586,12 @@ class MainWindow(QMainWindow):
             error_occurred = True
 
         if error_occurred:
-            self.device_capabilities[device_path] = {'av1': True, 'h264': True, 'hevc': True}
-            self.hw_decoder_capabilities[device_path] = {'h264': True, 'hevc': True, 'vp8': True, 'vp9': True, 'av1': True, 'mpeg2video': True}
+            self.device_capabilities[device_path] = {'av1': True, 'h264': True, 'hevc': True, 'gpu_vendor': 'unknown'}
+            self.hw_decoder_capabilities[device_path] = {'h264': True, 'hevc': True, 'vp8': True, 'vp9': True, 'av1': True, 'mpeg2video': True, 'gpu_vendor': 'unknown'}
+        else:
+            # Store GPU vendor in both capabilities dictionaries
+            self.device_capabilities[device_path]['gpu_vendor'] = gpu_vendor
+            self.hw_decoder_capabilities[device_path]['gpu_vendor'] = gpu_vendor
 
         self.update_codec_ui(self.v_codec.currentText())
 
