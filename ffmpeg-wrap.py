@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                 QComboBox, QTextEdit, QFormLayout, QMessageBox,
                                 QFileDialog, QCheckBox, QGroupBox, QListWidget,
                                 QListWidgetItem, QSlider, QSpinBox, QStackedWidget,
-                                QAbstractItemView, QSizePolicy)
+                                QAbstractItemView, QSizePolicy, QProgressBar)
 from PySide6.QtCore import Qt, QThread, Signal, QTimer
 from PySide6.QtGui import QFont
 
@@ -23,9 +23,13 @@ class EncoderWorker(QThread):
     scale_notification_signal = Signal(str)
     finished_signal = Signal(bool)
     compatibility_warning_signal = Signal(str)
+    progress_signal = Signal(int)  # Progress percentage (0-100)
     
     # Pre-compiled regex pattern for efficient log line filtering
     LOG_KEYWORD_PATTERN = re.compile(r'frame=|Error|Stream #|kb/s|kB time=|error|Invalid argument', re.IGNORECASE)
+    
+    # Pattern to extract time from FFmpeg progress output
+    TIME_PATTERN = re.compile(r'time=(\d{2}):(\d{2}):(\d{2}\.\d+)')
 
     def __init__(self, params):
         super().__init__()
@@ -35,6 +39,7 @@ class EncoderWorker(QThread):
         self.ffmpeg_path = params.get('ffmpeg_path', 'ffmpeg')
         self.ffprobe_path = params.get('ffprobe_path', 'ffprobe')
         self._process_lock = threading.Lock()
+        self.video_duration = 0.0  # Store video duration for progress calculation
 
     def cancel(self):
         self.is_cancelled = True
@@ -155,6 +160,21 @@ class EncoderWorker(QThread):
                         if line_count >= max_lines:
                             self.log_signal.emit("Warning: Log output limit reached, suppressing further messages.")
                             break
+                    
+                    # Parse progress from FFmpeg output
+                    if self.video_duration > 0:
+                        time_match = self.TIME_PATTERN.search(line)
+                        if time_match:
+                            try:
+                                hours = int(time_match.group(1))
+                                minutes = int(time_match.group(2))
+                                seconds = float(time_match.group(3))
+                                current_time = hours * 3600 + minutes * 60 + seconds
+                                progress = int((current_time / self.video_duration) * 100)
+                                progress = max(0, min(100, progress))  # Clamp between 0-100
+                                self.progress_signal.emit(progress)
+                            except (ValueError, ZeroDivisionError):
+                                pass
 
             self.process.wait(timeout=3600)  # 1 hour timeout
             # Capture returncode before cleaning up process reference
@@ -216,6 +236,7 @@ class EncoderWorker(QThread):
         selected_codec = p['v_codec']
 
         duration, orig_w, orig_h, input_codec, audio_count, audio_codec = self.get_video_info(input_file)
+        self.video_duration = duration if duration else 0.0
 
         if orig_w == 0 or orig_h == 0:
             self.log_signal.emit("Error: Could not determine video resolution.")
@@ -893,7 +914,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Linux FFMPEG VAAPI Wrapper")
-        self.setFixedSize(472, 620)
+        self.setFixedSize(472, 660)
         self.setAcceptDrops(True)
         self.batch_params = {}
         self.sleep_inhibitor = None
@@ -925,6 +946,10 @@ class MainWindow(QMainWindow):
         self.queue_list = QListWidget()
         self.queue_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.queue_list.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        # Reduce queue list font size by 2 points
+        queue_font = QApplication.font()
+        queue_font.setPointSizeF(queue_font.pointSizeF() - 2)
+        self.queue_list.setFont(queue_font)
 
         # Create widget to hold list and placeholder
         queue_list_widget = QWidget()
@@ -935,6 +960,9 @@ class MainWindow(QMainWindow):
 
         # Placeholder label (overlay on top of list)
         self.queue_placeholder = QLabel("Drag files here...")
+        placeholder_font = QApplication.font()
+        placeholder_font.setPointSizeF(placeholder_font.pointSizeF() + 1)
+        self.queue_placeholder.setFont(placeholder_font)
         self.queue_placeholder.setStyleSheet("color: #999; font-style: italic;")
         self.queue_placeholder.setAlignment(Qt.AlignCenter)
         self.queue_placeholder.setParent(self.queue_list)
@@ -1188,6 +1216,32 @@ class MainWindow(QMainWindow):
         self.log.setFont(log_font)
         self.log.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         layout.addWidget(self.log)
+
+        # --- PROGRESS BAR ---
+        progress_container = QWidget()
+        progress_layout = QHBoxLayout(progress_container)
+        progress_layout.setContentsMargins(2, 2, 2, 2)
+        
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setStyleSheet("""
+            QProgressBar {
+                border: 2px solid grey;
+                border-radius: 5px;
+                text-align: center;
+                background-color: #333;
+                color: white;
+            }
+            QProgressBar::chunk {
+                background-color: #4CAF50;
+                border-radius: 3px;
+            }
+        """)
+        
+        progress_layout.addWidget(self.progress_bar)
+        layout.addWidget(progress_container)
         
         # --- BUTTONS ---
         btn_row = QHBoxLayout()
@@ -1817,6 +1871,10 @@ class MainWindow(QMainWindow):
     
     def show_compatibility_warning(self, message):
         QMessageBox.warning(self, "Compatibility Error", message)
+    
+    def update_progress(self, value):
+        """Update the progress bar with the current value (0-100)"""
+        self.progress_bar.setValue(value)
 
     def dragEnterEvent(self, e):
         if e.mimeData().hasUrls(): e.accept()
@@ -2056,11 +2114,15 @@ class MainWindow(QMainWindow):
         current_job_params = self.batch_params.copy()
         current_job_params['input'] = fpath
 
+        # Reset progress bar for new job
+        self.progress_bar.setValue(0)
+
         self.worker = EncoderWorker(current_job_params)
         self.worker.log_signal.connect(self.log.append)
         self.worker.scale_notification_signal.connect(self.show_scale_notification)
         self.worker.finished_signal.connect(self.job_finished)
         self.worker.compatibility_warning_signal.connect(self.show_compatibility_warning)
+        self.worker.progress_signal.connect(self.update_progress)
         self.worker.start()
 
     def job_finished(self, success):
@@ -2114,6 +2176,7 @@ class MainWindow(QMainWindow):
         self.btn_rem_queue.setEnabled(True)
         self.btn_clear_queue.setEnabled(True)
         self.queue_list.setEnabled(True)
+        self.progress_bar.setValue(0)  # Reset progress bar
 
     def cancel(self):
         if self.worker and self.worker.isRunning():
