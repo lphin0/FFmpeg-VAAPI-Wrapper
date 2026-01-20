@@ -349,7 +349,26 @@ class EncoderWorker(QThread):
             audio_bitrate = 1536.0
             audio_ext_hint = ".mov"
         else:
-            enc = "libopus" if a_codec == "Opus" else "aac"
+            # Select audio encoder based on codec preference and availability
+            audio_encoders = p.get('audio_encoders', {})
+            
+            if a_codec == "Opus":
+                # Use libopus if available, otherwise fallback to native opus
+                if audio_encoders.get('opus', False):
+                    enc = "libopus"
+                    self.log_signal.emit("Audio Encoder: Using libopus (high quality)")
+                else:
+                    enc = "opus"  # Native opus
+                    self.log_signal.emit("Audio Encoder: Using native opus")
+            else:  # AAC
+                # Use libfdk-aac if available, otherwise fallback to native aac
+                if audio_encoders.get('aac', False):
+                    enc = "libfdk_aac"
+                    self.log_signal.emit("Audio Encoder: Using libfdk_aac (high quality)")
+                else:
+                    enc = "aac"  # Native aac
+                    self.log_signal.emit("Audio Encoder: Using native aac")
+            
             try:
                 raw_bitrate = float(p.get('a_bitrate', 128))
                 if raw_bitrate < 8: raw_bitrate = 128.0
@@ -361,7 +380,7 @@ class EncoderWorker(QThread):
             if enc == "libopus":
                 audio_flags.extend(["-sample_fmt", "flt"])
 
-            audio_ext_hint = ".webm" if enc == "libopus" else ".mp4"
+            audio_ext_hint = ".webm" if "opus" in enc else ".mp4"
 
         # --- Resolve Output Container ---
         if container_mode == "MP4": ext = ".mp4"
@@ -803,6 +822,294 @@ class EncoderWorker(QThread):
 
         self.finished_signal.emit(success)
 
+class SWEncoderChecker(QThread):
+    """Thread-safe checker for software video encoders"""
+    log_signal = Signal(str)  # Single consolidated log message
+    finished_signal = Signal(dict)
+    warning_signal = Signal(str, str)  # title, message
+    
+    def __init__(self, ffmpeg_path):
+        super().__init__()
+        self.ffmpeg_path = ffmpeg_path if ffmpeg_path else 'ffmpeg'
+        self.available_codecs = {'h264': False, 'hevc': False}
+        self.log_messages = []
+    
+    def run(self):
+        ffmpeg_not_found = False
+        unavailable_codecs = []
+        codecs_to_check = [
+            ('h264', 'libx264', 'H.264'),
+            ('hevc', 'libx265', 'H.265')
+        ]
+        
+        self.log_messages.append("Checking software video encoders...")
+        
+        for key, codec, display_name in codecs_to_check:
+            try:
+                cmd = [
+                    self.ffmpeg_path, "-y", "-hide_banner",
+                    "-f", "lavfi", "-i", "nullsrc=duration=1:size=320x240:rate=1",
+                    "-c:v", codec,
+                    "-f", "null", "-"
+                ]
+                result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
+                if result.returncode == 0:
+                    self.available_codecs[key] = True
+                    self.log_messages.append(f"SW Encoder: {display_name} - Available")
+                else:
+                    self.available_codecs[key] = False
+                    self.log_messages.append(f"SW Encoder: {display_name} - Not Available")
+                    unavailable_codecs.append(display_name)
+            except FileNotFoundError:
+                self.log_messages.append("Error: FFmpeg not found. Cannot verify software encoder capabilities.")
+                ffmpeg_not_found = True
+                break
+            except subprocess.TimeoutExpired:
+                self.log_messages.append(f"Error: Timeout checking {codec}. Encoder may not be responsive.")
+                self.available_codecs[key] = False
+                unavailable_codecs.append(display_name)
+            except Exception as e:
+                self.log_messages.append(f"Error checking {codec}: {str(e)}")
+                self.available_codecs[key] = False
+                unavailable_codecs.append(display_name)
+        
+        if ffmpeg_not_found:
+            self.warning_signal.emit("FFmpeg Not Found",
+                                    "FFmpeg executable not found on your system!\n\n"
+                                    "Please install FFmpeg to use this application.\n"
+                                    "On Fedora: sudo dnf install ffmpeg\n"
+                                    "On Ubuntu: sudo apt install ffmpeg")
+            self.available_codecs = {'h264': True, 'hevc': True}
+        elif unavailable_codecs:
+            codec_list = ", ".join(unavailable_codecs)
+            self.warning_signal.emit("Missing Codec Support",
+                                    f"Your FFmpeg build does not support the following codecs:\n\n"
+                                    f"{codec_list}\n\n"
+                                    f"These codecs will be grayed out in the dropdown.\n"
+                                    f"Consider installing a full FFmpeg build with all codecs enabled.")
+        
+        # Emit all log messages as one consolidated message
+        self.log_signal.emit('\n'.join(self.log_messages))
+        self.finished_signal.emit(self.available_codecs)
+
+
+class AudioEncoderChecker(QThread):
+    """Thread-safe checker for audio encoders"""
+    log_signal = Signal(str)  # Single consolidated log message
+    finished_signal = Signal(dict)
+    
+    def __init__(self, ffmpeg_path):
+        super().__init__()
+        self.ffmpeg_path = ffmpeg_path if ffmpeg_path else 'ffmpeg'
+        self.available_encoders = {'opus': False, 'aac': False}
+        self.log_messages = []
+    
+    def run(self):
+        self.log_messages.append("Checking audio encoder availability...")
+        
+        try:
+            cmd = [self.ffmpeg_path, "-hide_banner", "-encoders"]
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+            if result.returncode == 0:
+                encoders_output = result.stdout.decode()
+                if "libopus" in encoders_output:
+                    self.available_encoders['opus'] = True
+                    self.log_messages.append("Audio Encoder: libopus - Available")
+                else:
+                    self.available_encoders['opus'] = False
+                    self.log_messages.append("Audio Encoder: libopus - Not Available")
+                
+                if "libfdk_aac" in encoders_output:
+                    self.available_encoders['aac'] = True
+                    self.log_messages.append("Audio Encoder: libfdk_aac - Available")
+                else:
+                    self.available_encoders['aac'] = False
+                    self.log_messages.append("Audio Encoder: libfdk_aac - Not Available (will use native aac)")
+            else:
+                self.available_encoders['opus'] = False
+                self.available_encoders['aac'] = False
+                self.log_messages.append("Audio Encoder: Could not check encoders, assuming native implementations only")
+        except FileNotFoundError:
+            self.log_messages.append("Error: FFmpeg not found. Cannot verify audio encoder capabilities.")
+            self.available_encoders['opus'] = False
+            self.available_encoders['aac'] = False
+        except subprocess.TimeoutExpired:
+            self.log_messages.append("Error: Timeout checking audio encoders.")
+            self.available_encoders['opus'] = False
+            self.available_encoders['aac'] = False
+        except Exception as e:
+            self.log_messages.append(f"Error checking audio encoders: {str(e)}")
+            self.available_encoders['opus'] = False
+            self.available_encoders['aac'] = False
+        
+        self.log_messages.append("Audio Encoder: native opus and aac - Available (fallback)")
+        
+        # Emit all log messages as one consolidated message
+        self.log_signal.emit('\n'.join(self.log_messages))
+        self.finished_signal.emit(self.available_encoders)
+
+
+class HWDeviceProber(QThread):
+    """Thread-safe hardware device encoder capability prober"""
+    log_signal = Signal(str)  # Single consolidated log message
+    finished_signal = Signal(str, dict)  # device_path, capabilities
+    warning_signal = Signal(str)  # message
+    
+    def __init__(self, ffmpeg_path, device_path):
+        super().__init__()
+        self.ffmpeg_path = ffmpeg_path if ffmpeg_path else 'ffmpeg'
+        self.device_path = device_path
+        self.capabilities = {'av1': False, 'h264': False, 'hevc': False}
+        self.log_messages = []
+    
+    def detect_gpu_vendor(self):
+        """Detect GPU vendor from DRI device path"""
+        try:
+            device_num = self.device_path.split('renderD')[-1]
+            vendor_path = f"/sys/class/drm/renderD{device_num}/device/vendor"
+            if os.path.exists(vendor_path):
+                with open(vendor_path, 'r') as f:
+                    vendor_id = f.read().strip()
+                    if vendor_id.lower() == '0x8086':
+                        return 'intel'
+                    elif vendor_id.lower() in ['0x1002', '0x1022']:
+                        return 'amd'
+            
+            card_path = f"/sys/class/drm/renderD{device_num}"
+            if os.path.exists(card_path):
+                device_link = os.path.realpath(f"{card_path}/device")
+                if 'i915' in device_link.lower():
+                    return 'intel'
+                elif 'amdgpu' in device_link.lower() or 'radeon' in device_link.lower():
+                    return 'amd'
+            
+            return 'unknown'
+        except Exception as e:
+            self.log_messages.append(f"Warning: Could not detect GPU vendor: {e}")
+            return 'unknown'
+    
+    def run(self):
+        self.log_messages.append(f"Probing device: {self.device_path} ...")
+        
+        gpu_vendor = self.detect_gpu_vendor()
+        self.log_messages.append(f"  -> GPU Vendor: {gpu_vendor.upper()}")
+        error_occurred = False
+        
+        # Probe hardware encoders
+        codecs_to_check = [
+            ('h264', 'h264_vaapi'),
+            ('hevc', 'hevc_vaapi'),
+            ('av1', 'av1_vaapi')
+        ]
+        
+        try:
+            for key, codec in codecs_to_check:
+                cmd = [
+                    self.ffmpeg_path, "-y", "-hide_banner",
+                    "-init_hw_device", f"vaapi=dev:{self.device_path}",
+                    "-filter_hw_device", "dev",
+                    "-f", "lavfi", "-i", "nullsrc=duration=1:size=320x240:rate=1",
+                    "-vf", "format=nv12,hwupload",
+                    "-c:v", codec,
+                    "-f", "null", "-"
+                ]
+                
+                try:
+                    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.log_messages.append(f"  -> {codec.upper()} Encoder: Not Supported (Timeout)")
+                    self.capabilities[key] = False
+                    continue
+                
+                if result.returncode == 0:
+                    self.capabilities[key] = True
+                    self.log_messages.append(f"  -> {codec.upper()} Encoder: Supported")
+                else:
+                    stderr_text = result.stderr.decode()
+                    if "No such device" in stderr_text or "Permission denied" in stderr_text:
+                        raise Exception(f"Cannot access device {self.device_path}: {stderr_text.strip()}")
+                    self.log_messages.append(f"  -> {codec.upper()} Encoder: Not Supported")
+            
+        except FileNotFoundError:
+            self.log_messages.append("Error: FFmpeg not found. Cannot verify hardware capabilities.")
+            self.warning_signal.emit("FFmpeg executable not found. All codec options enabled (Use at your own risk).")
+            error_occurred = True
+        except Exception as e:
+            self.log_messages.append(f"Error probing device: {str(e)}")
+            self.warning_signal.emit(f"Could not verify capabilities for {self.device_path}. All codecs enabled (Use at your own risk).")
+            error_occurred = True
+        
+        if error_occurred:
+            self.capabilities = {'av1': True, 'h264': True, 'hevc': True, 'gpu_vendor': 'unknown'}
+        else:
+            self.capabilities['gpu_vendor'] = gpu_vendor
+        
+        # Emit all log messages as one consolidated message
+        self.log_signal.emit('\n'.join(self.log_messages))
+        self.finished_signal.emit(self.device_path, self.capabilities)
+
+
+class HWDecoderChecker(QThread):
+    """Thread-safe hardware device decoder capability prober"""
+    log_signal = Signal(str)  # Single consolidated log message
+    finished_signal = Signal(str, dict)  # device_path, decoder_caps
+    warning_signal = Signal(str)  # message
+    
+    def __init__(self, ffmpeg_path, device_path):
+        super().__init__()
+        self.ffmpeg_path = ffmpeg_path if ffmpeg_path else 'ffmpeg'
+        self.device_path = device_path
+        self.decoder_caps = {'h264': False, 'hevc': False, 'vp8': False, 'vp9': False, 'av1': False, 'mpeg2video': False}
+        self.log_messages = []
+    
+    def run(self):
+        self.log_messages.append(f"  Probing hardware decoder support...")
+        error_occurred = False
+        
+        decoder_codecs = ['h264', 'hevc', 'vp8', 'vp9', 'av1', 'mpeg2video']
+        
+        try:
+            for dec_codec in decoder_codecs:
+                cmd = [
+                    self.ffmpeg_path, "-y", "-hide_banner",
+                    "-hwaccel", "vaapi",
+                    "-hwaccel_device", self.device_path,
+                    "-f", "lavfi", "-i", "nullsrc=duration=1:size=320x240:rate=1",
+                    "-c:v", "rawvideo",
+                    "-f", "null", "-"
+                ]
+                
+                try:
+                    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.decoder_caps[dec_codec] = False
+                    self.log_messages.append(f"  -> {dec_codec.upper()} Decoder: Not Supported (Timeout)")
+                    continue
+                
+                if result.returncode == 0:
+                    self.decoder_caps[dec_codec] = True
+                    self.log_messages.append(f"  -> {dec_codec.upper()} Decoder: Supported")
+                else:
+                    self.decoder_caps[dec_codec] = False
+                    self.log_messages.append(f"  -> {dec_codec.upper()} Decoder: Not Supported")
+            
+        except FileNotFoundError:
+            self.log_messages.append("Error: FFmpeg not found. Cannot verify hardware capabilities.")
+            self.warning_signal.emit("FFmpeg executable not found. All codec options enabled (Use at your own risk).")
+            error_occurred = True
+        except Exception as e:
+            self.log_messages.append(f"Error probing device: {str(e)}")
+            self.warning_signal.emit(f"Could not verify capabilities for {self.device_path}. All codecs enabled (Use at your own risk).")
+            error_occurred = True
+        
+        if error_occurred:
+            self.decoder_caps = {'h264': True, 'hevc': True, 'vp8': True, 'vp9': True, 'av1': True, 'mpeg2video': True, 'gpu_vendor': 'unknown'}
+        
+        # Emit all log messages as one consolidated message
+        self.log_signal.emit('\n'.join(self.log_messages))
+        self.finished_signal.emit(self.device_path, self.decoder_caps)
+
+
 class NotificationManager:
     """Generate pleasant tones without any external files"""
     
@@ -924,8 +1231,15 @@ class MainWindow(QMainWindow):
         self.device_capabilities = {}
         self.warning_shown = False
         self.available_sw_codecs = {'h264': False, 'hevc': False}
+        self.available_audio_encoders = {'opus': False, 'aac': False}
         self.hw_decoder_capabilities = {}  # Store hardware decoder capabilities
         self.notification_manager = NotificationManager()
+        
+        # Thread checkers for background initialization
+        self.sw_encoder_checker = None
+        self.audio_encoder_checker = None
+        self.hw_device_prober = None
+        self.hw_decoder_checker = None
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -1286,7 +1600,8 @@ class MainWindow(QMainWindow):
         # Schedule background initialization tasks after window is shown
         # This prevents UI blocking during device probing and encoder checking
         QTimer.singleShot(100, self.check_sw_encoders)
-        QTimer.singleShot(150, self.initial_probe)
+        QTimer.singleShot(150, self.check_audio_encoders)
+        QTimer.singleShot(200, self.initial_probe)
         QTimer.singleShot(0, self.update_queue_placeholder)  # Initialize placeholder visibility
         
         self.worker = None
@@ -1379,68 +1694,71 @@ class MainWindow(QMainWindow):
             self.mode_stack.setEnabled(False)
 
     # --- SOFTWARE ENCODER DETECTION ---
+    
+    def on_sw_encoders_found(self, available_codecs):
+        """Handle completion of software encoder checking"""
+        self.available_sw_codecs = available_codecs
+        self.update_codec_options()
+        self.sw_encoder_checker = None
+    
+    def on_audio_encoders_found(self, available_encoders):
+        """Handle completion of audio encoder checking"""
+        self.available_audio_encoders = available_encoders
+        self.audio_encoder_checker = None
+    
+    def on_device_encoders_found(self, device_path, capabilities):
+        """Handle completion of hardware encoder probing"""
+        self.device_capabilities[device_path] = capabilities
+        self.hw_device_prober = None
+    
+    def on_device_decoders_found(self, device_path, decoder_caps):
+        """Handle completion of hardware decoder probing"""
+        self.hw_decoder_capabilities[device_path] = decoder_caps
+        self.hw_decoder_checker = None
+        self.update_codec_ui(self.v_codec.currentText())
+    
+    def on_encoder_warning(self, title, message):
+        """Show warning message from encoder checker"""
+        QMessageBox.warning(self, title, message)
+    
+    def on_device_warning(self, message):
+        """Show warning message from device prober"""
+        if not self.warning_shown:
+            QMessageBox.warning(self, "Capability Detection Warning",
+                              f"{message}\n\nThe application will attempt to proceed, but encoding may fail if the hardware does not support the selected codec.")
+            self.warning_shown = True
+    
+    def on_encoder_log(self, message):
+        """Handle consolidated log message from encoder checker threads"""
+        # Split the message by newlines and append each line separately
+        for line in message.split('\n'):
+            if line.strip():  # Only append non-empty lines
+                self.log.append(line)
+    
     def check_sw_encoders(self):
-        """Check which software encoders are available in the FFmpeg build"""
+        """Check which software encoders are available in the FFmpeg build (threaded)"""
         # Get custom FFmpeg path if provided
         ffmpeg_path = self.ffmpeg_path.text().strip() if hasattr(self, 'ffmpeg_path') else ''
         ffmpeg_cmd = ffmpeg_path if ffmpeg_path else 'ffmpeg'
         
-        ffmpeg_not_found = False
-        unavailable_codecs = []
-        codecs_to_check = [
-            ('h264', 'libx264', 'H.264'),
-            ('hevc', 'libx265', 'H.265')
-        ]
+        # Create and start the checker thread
+        self.sw_encoder_checker = SWEncoderChecker(ffmpeg_cmd)
+        self.sw_encoder_checker.log_signal.connect(self.on_encoder_log)
+        self.sw_encoder_checker.finished_signal.connect(self.on_sw_encoders_found)
+        self.sw_encoder_checker.warning_signal.connect(self.on_encoder_warning)
+        self.sw_encoder_checker.start()
 
-        for key, codec, display_name in codecs_to_check:
-            try:
-                cmd = [
-                    ffmpeg_cmd, "-y", "-hide_banner",
-                    "-f", "lavfi", "-i", "nullsrc=duration=1:size=320x240:rate=1",
-                    "-c:v", codec,
-                    "-f", "null", "-"
-                ]
-                result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
-                if result.returncode == 0:
-                    self.available_sw_codecs[key] = True
-                    self.log.append(f"SW Encoder: {display_name} - Available")
-                else:
-                    self.available_sw_codecs[key] = False
-                    self.log.append(f"SW Encoder: {display_name} - Not Available")
-                    unavailable_codecs.append(display_name)
-            except FileNotFoundError:
-                self.log.append("Error: FFmpeg not found. Cannot verify software encoder capabilities.")
-                ffmpeg_not_found = True
-                break
-            except subprocess.TimeoutExpired:
-                self.log.append(f"Error: Timeout checking {codec}. Encoder may not be responsive.")
-                self.available_sw_codecs[key] = False
-                unavailable_codecs.append(display_name)
-            except Exception as e:
-                self.log.append(f"Error checking {codec}: {str(e)}")
-                self.available_sw_codecs[key] = False
-                unavailable_codecs.append(display_name)
-
-        # Show popup if FFmpeg is not found
-        if ffmpeg_not_found:
-            QMessageBox.critical(self, "FFmpeg Not Found",
-                                "FFmpeg executable not found on your system!\n\n"
-                                "Please install FFmpeg to use this application.\n"
-                                "On Fedora: sudo dnf install ffmpeg\n"
-                                "On Ubuntu: sudo apt install ffmpeg")
-            # Assume all are available if FFmpeg is not found (for testing purposes)
-            self.available_sw_codecs = {'h264': True, 'hevc': True}
-        # Show popup if some codecs are unavailable
-        elif unavailable_codecs:
-            codec_list = ", ".join(unavailable_codecs)
-            QMessageBox.warning(self, "Missing Codec Support",
-                                f"Your FFmpeg build does not support the following codecs:\n\n"
-                                f"{codec_list}\n\n"
-                                f"These codecs will be grayed out in the dropdown.\n"
-                                f"Consider installing a full FFmpeg build with all codecs enabled.")
-
-        # Update codec dropdown based on availability
-        self.update_codec_options()
+    def check_audio_encoders(self):
+        """Check which audio encoders are available in the FFmpeg build (threaded)"""
+        # Get custom FFmpeg path if provided
+        ffmpeg_path = self.ffmpeg_path.text().strip() if hasattr(self, 'ffmpeg_path') else ''
+        ffmpeg_cmd = ffmpeg_path if ffmpeg_path else 'ffmpeg'
+        
+        # Create and start the checker thread
+        self.audio_encoder_checker = AudioEncoderChecker(ffmpeg_cmd)
+        self.audio_encoder_checker.log_signal.connect(self.on_encoder_log)
+        self.audio_encoder_checker.finished_signal.connect(self.on_audio_encoders_found)
+        self.audio_encoder_checker.start()
 
     def update_codec_options(self):
         """Update the video codec dropdown based on available encoders"""
@@ -1518,39 +1836,8 @@ class MainWindow(QMainWindow):
         if device:
             self.probe_device(device)
 
-    def detect_gpu_vendor(self, device_path):
-        """Detect GPU vendor from DRI device path"""
-        try:
-            # Extract device number from path (e.g., /dev/dri/renderD128 -> 128)
-            device_num = device_path.split('renderD')[-1]
-            
-            # Try to read vendor from sysfs
-            vendor_path = f"/sys/class/drm/renderD{device_num}/device/vendor"
-            if os.path.exists(vendor_path):
-                with open(vendor_path, 'r') as f:
-                    vendor_id = f.read().strip()
-                    # Intel vendor ID is 0x8086
-                    if vendor_id.lower() == '0x8086':
-                        return 'intel'
-                    # AMD vendor IDs: 0x1002 (ATI) or 0x1022
-                    elif vendor_id.lower() in ['0x1002', '0x1022']:
-                        return 'amd'
-            
-            # Fallback: try to parse from device name
-            card_path = f"/sys/class/drm/renderD{device_num}"
-            if os.path.exists(card_path):
-                device_link = os.path.realpath(f"{card_path}/device")
-                if 'i915' in device_link.lower():
-                    return 'intel'
-                elif 'amdgpu' in device_link.lower() or 'radeon' in device_link.lower():
-                    return 'amd'
-            
-            return 'unknown'
-        except Exception as e:
-            self.log.append(f"Warning: Could not detect GPU vendor: {e}")
-            return 'unknown'
-
     def probe_device(self, device_path):
+        """Probe device capabilities (threaded)"""
         if device_path in self.device_capabilities:
             self.update_codec_ui(self.v_codec.currentText())
             return
@@ -1559,107 +1846,19 @@ class MainWindow(QMainWindow):
         ffmpeg_path = self.ffmpeg_path.text().strip() if hasattr(self, 'ffmpeg_path') else ''
         ffmpeg_cmd = ffmpeg_path if ffmpeg_path else 'ffmpeg'
 
-        self.log.append(f"Probing device: {device_path} ...")
+        # Create and start the encoder prober thread
+        self.hw_device_prober = HWDeviceProber(ffmpeg_cmd, device_path)
+        self.hw_device_prober.log_signal.connect(self.on_encoder_log)
+        self.hw_device_prober.finished_signal.connect(self.on_device_encoders_found)
+        self.hw_device_prober.warning_signal.connect(self.on_device_warning)
+        self.hw_device_prober.start()
         
-        # Detect GPU vendor
-        gpu_vendor = self.detect_gpu_vendor(device_path)
-        self.log.append(f"  -> GPU Vendor: {gpu_vendor.upper()}")
-        capabilities = {'av1': False, 'h264': False, 'hevc': False}
-        decoder_caps = {'h264': False, 'hevc': False, 'vp8': False, 'vp9': False, 'av1': False, 'mpeg2video': False}
-        error_occurred = False
-
-        # Probe hardware encoders
-        codecs_to_check = [
-            ('h264', 'h264_vaapi'),
-            ('hevc', 'hevc_vaapi'),
-            ('av1', 'av1_vaapi')
-        ]
-
-        try:
-            for key, codec in codecs_to_check:
-                cmd = [
-                    ffmpeg_cmd, "-y", "-hide_banner",
-                    "-init_hw_device", f"vaapi=dev:{device_path}",
-                    "-filter_hw_device", "dev",
-                    "-f", "lavfi", "-i", "nullsrc=duration=1:size=320x240:rate=1",
-                    "-vf", "format=nv12,hwupload",
-                    "-c:v", codec,
-                    "-f", "null", "-"
-                ]
-
-                try:
-                    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
-                except subprocess.TimeoutExpired:
-                    self.log.append(f"  -> {codec.upper()} Encoder: Not Supported (Timeout)")
-                    capabilities[key] = False
-                    continue
-
-                if result.returncode == 0:
-                    capabilities[key] = True
-                    self.log.append(f"  -> {codec.upper()} Encoder: Supported")
-                else:
-                    stderr_text = result.stderr.decode()
-                    if "No such device" in stderr_text or "Permission denied" in stderr_text:
-                        raise Exception(f"Cannot access device {device_path}: {stderr_text.strip()}")
-
-                    self.log.append(f"  -> {codec.upper()} Encoder: Not Supported")
-
-            self.device_capabilities[device_path] = capabilities
-
-            # Probe hardware decoders
-            self.log.append("  Probing hardware decoder support...")
-            decoder_codecs = ['h264', 'hevc', 'vp8', 'vp9', 'av1', 'mpeg2video']
-            
-            for dec_codec in decoder_codecs:
-                cmd = [
-                    ffmpeg_cmd, "-y", "-hide_banner",
-                    "-hwaccel", "vaapi",
-                    "-hwaccel_device", device_path,
-                    "-f", "lavfi", "-i", "nullsrc=duration=1:size=320x240:rate=1",
-                    "-c:v", "rawvideo",
-                    "-f", "null", "-"
-                ]
-                
-                try:
-                    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
-                except subprocess.TimeoutExpired:
-                    decoder_caps[dec_codec] = False
-                    self.log.append(f"  -> {dec_codec.upper()} Decoder: Not Supported (Timeout)")
-                    continue
-                
-                if result.returncode == 0:
-                    decoder_caps[dec_codec] = True
-                    self.log.append(f"  -> {dec_codec.upper()} Decoder: Supported")
-                else:
-                    decoder_caps[dec_codec] = False
-                    self.log.append(f"  -> {dec_codec.upper()} Decoder: Not Supported")
-            
-            self.hw_decoder_capabilities[device_path] = decoder_caps
-
-        except FileNotFoundError:
-            self.log.append("Error: FFmpeg not found. Cannot verify hardware capabilities.")
-            self.capabilities_warning("FFmpeg executable not found. All codec options enabled (Use at your own risk).")
-            error_occurred = True
-        except Exception as e:
-            self.log.append(f"Error probing device: {str(e)}")
-            self.capabilities_warning(f"Could not verify capabilities for {device_path}. All codecs enabled (Use at your own risk).")
-            error_occurred = True
-
-        if error_occurred:
-            self.device_capabilities[device_path] = {'av1': True, 'h264': True, 'hevc': True, 'gpu_vendor': 'unknown'}
-            self.hw_decoder_capabilities[device_path] = {'h264': True, 'hevc': True, 'vp8': True, 'vp9': True, 'av1': True, 'mpeg2video': True, 'gpu_vendor': 'unknown'}
-        else:
-            # Store GPU vendor in both capabilities dictionaries
-            self.device_capabilities[device_path]['gpu_vendor'] = gpu_vendor
-            self.hw_decoder_capabilities[device_path]['gpu_vendor'] = gpu_vendor
-
-        self.update_codec_ui(self.v_codec.currentText())
-
-    def capabilities_warning(self, message):
-        if not self.warning_shown:
-            QMessageBox.warning(self, "Capability Detection Warning",
-                                f"{message}\n\nThe application will attempt to proceed, but encoding may fail if the hardware does not support the selected codec.")
-            self.warning_shown = True
+        # Create and start the decoder checker thread
+        self.hw_decoder_checker = HWDecoderChecker(ffmpeg_cmd, device_path)
+        self.hw_decoder_checker.log_signal.connect(self.on_encoder_log)
+        self.hw_decoder_checker.finished_signal.connect(self.on_device_decoders_found)
+        self.hw_decoder_checker.warning_signal.connect(self.on_device_warning)
+        self.hw_decoder_checker.start()
 
     # --- UI UPDATERS ---
     def update_codec_ui(self, codec_text):
@@ -1937,9 +2136,24 @@ class MainWindow(QMainWindow):
         
         self.log.append("FFmpeg path changed. Re-detecting capabilities...")
         self.available_sw_codecs = {'h264': False, 'hevc': False}
+        self.available_audio_encoders = {'opus': False, 'aac': False}
         self.device_capabilities = {}
+        self.hw_decoder_capabilities = {}
         self.update_codec_options()
+        
+        # Stop existing threads if running
+        if self.sw_encoder_checker and self.sw_encoder_checker.isRunning():
+            self.sw_encoder_checker.wait(1000)
+        if self.audio_encoder_checker and self.audio_encoder_checker.isRunning():
+            self.audio_encoder_checker.wait(1000)
+        if self.hw_device_prober and self.hw_device_prober.isRunning():
+            self.hw_device_prober.wait(1000)
+        if self.hw_decoder_checker and self.hw_decoder_checker.isRunning():
+            self.hw_decoder_checker.wait(1000)
+        
+        # Start new checks
         self.check_sw_encoders()
+        self.check_audio_encoders()
         if self.device_combo.count() > 0:
             self.probe_device(self.device_combo.currentText())
 
@@ -2100,6 +2314,7 @@ class MainWindow(QMainWindow):
             'container': container_code,
             'auto_scale': self.chk_auto_scale.isChecked(),
             'hw_decoder_caps': self.hw_decoder_capabilities.get(self.device_combo.currentText(), {}),
+            'audio_encoders': self.available_audio_encoders,
             'ffmpeg_path': ffmpeg_path,
             'ffprobe_path': ffprobe_path
         }
