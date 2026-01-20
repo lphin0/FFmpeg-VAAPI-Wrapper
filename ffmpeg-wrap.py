@@ -268,6 +268,7 @@ class EncoderWorker(QThread):
             video_codec_cmd = "copy"
             v_tag = "_passthrough"
             is_av1 = False
+            is_vp9 = False
             use_hw = False
         else:
             # --- Determine Codec Command ---
