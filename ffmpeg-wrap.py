@@ -568,13 +568,13 @@ class EncoderWorker(QThread):
         vf_chain = []
         algo = p.get('algo', 'Bicubic')
 
-        # Add framerate filter if specified (before scaling)
-        if fps_filter:
+        # Add framerate filter if specified (before scaling, only for non-passthrough)
+        if fps_filter and video_codec_cmd != "copy":
             vf_chain.append(fps_filter)
 
         # --- PIPELINE CONSTRUCTION (SW vs HW) ---
         if video_codec_cmd == "copy":
-            # Video passthrough - no scaling or encoding
+            # Video passthrough - no scaling or encoding, no framerate changes
             self.log_signal.emit("Pipeline: Video Passthrough (No re-encoding)")
             base_cmd.extend(["-i", input_file])
             vf_chain = []
@@ -1372,6 +1372,8 @@ class MainWindow(QMainWindow):
             self.chk_copy_data.setEnabled(True)  # Keep copy data enabled
             self.res_combo.setEnabled(False)
             self.ar_combo.setEnabled(False)
+            self.fps_combo.setEnabled(False)
+            self.fps_custom_input.setEnabled(False)
             self.algo_combo.setEnabled(False)
             self.chk_auto_scale.setEnabled(False)
             self.mode_stack.setEnabled(False)
