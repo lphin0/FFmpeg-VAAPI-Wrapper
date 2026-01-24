@@ -989,10 +989,8 @@ class HWDeviceProber(QThread):
             return 'unknown'
     
     def run(self):
-        self.log_messages.append(f"Probing device: {self.device_path} ...")
-        
         gpu_vendor = self.detect_gpu_vendor()
-        self.log_messages.append(f"  -> GPU Vendor: {gpu_vendor.upper()}")
+        self.log_messages.append(f"Hardware Device: {self.device_path} (GPU: {gpu_vendor.upper()})")
         error_occurred = False
         
         # Probe hardware encoders
@@ -1063,7 +1061,7 @@ class HWDecoderChecker(QThread):
         self.log_messages = []
     
     def run(self):
-        self.log_messages.append(f"  Probing hardware decoder support...")
+        self.log_messages.append(f"  Hardware decoder support:")
         error_occurred = False
         
         decoder_codecs = ['h264', 'hevc', 'vp8', 'vp9', 'av1', 'mpeg2video']
@@ -1240,6 +1238,7 @@ class MainWindow(QMainWindow):
         self.audio_encoder_checker = None
         self.hw_device_prober = None
         self.hw_decoder_checker = None
+        self.hw_encoder_check_complete = False  # Track when encoder check is done
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -1565,6 +1564,7 @@ class MainWindow(QMainWindow):
         self.btn_start.setStyleSheet("background-color: #2e7d32; color: white; font-weight: bold; padding: 10px;")
 
         self.chk_no_popup = QCheckBox("No Popup")
+        self.chk_no_popup.setChecked(True)
         self.chk_no_sound = QCheckBox("No Sound")
 
         self.btn_cancel = QPushButton("Cancel")
@@ -1710,12 +1710,22 @@ class MainWindow(QMainWindow):
         """Handle completion of hardware encoder probing"""
         self.device_capabilities[device_path] = capabilities
         self.hw_device_prober = None
+        self.hw_encoder_check_complete = True
+        
+        # Check if both encoder and decoder checks are complete
+        if self.hw_encoder_check_complete and self.hw_decoder_checker is None:
+            # All checks done, refresh UI
+            self.update_codec_ui(self.v_codec.currentText())
     
     def on_device_decoders_found(self, device_path, decoder_caps):
         """Handle completion of hardware decoder probing"""
         self.hw_decoder_capabilities[device_path] = decoder_caps
         self.hw_decoder_checker = None
-        self.update_codec_ui(self.v_codec.currentText())
+        
+        # Check if both encoder and decoder checks are complete
+        if self.hw_encoder_check_complete and self.hw_decoder_checker is None:
+            # All checks done, refresh UI
+            self.update_codec_ui(self.v_codec.currentText())
     
     def on_encoder_warning(self, title, message):
         """Show warning message from encoder checker"""
@@ -1983,7 +1993,7 @@ class MainWindow(QMainWindow):
             self.quality_combo.addItem("Balanced (Default)", 2)
             self.quality_combo.addItem("Speed (Fast)", 4)
             self.quality_combo.addItem("Max Speed", 7)
-            self.quality_combo.setCurrentIndex(1)
+            self.quality_combo.setCurrentIndex(0)
         else:
             presets = [
                 ("veryslow", 0), ("slower", 1), ("slow", 2), ("medium", 3),
