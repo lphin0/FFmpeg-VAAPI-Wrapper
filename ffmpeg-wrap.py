@@ -16,6 +16,8 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                 QListWidgetItem, QSlider, QSpinBox, QStackedWidget,
                                 QAbstractItemView, QSizePolicy, QProgressBar)
 from PySide6.QtCore import Qt, QThread, Signal, QTimer
+import time
+import time
 from PySide6.QtGui import QFont
 
 class EncoderWorker(QThread):
@@ -147,8 +149,11 @@ class EncoderWorker(QThread):
                                 pass
                     break
 
-                line = self.process.stdout.readline()
-                if not line and self.process.poll() is not None:
+                if self.process and self.process.stdout:
+                    line = self.process.stdout.readline()
+                    if not line and self.process.poll() is not None:
+                        break
+                else:
                     break
 
                 if line:
@@ -418,13 +423,14 @@ class EncoderWorker(QThread):
             "240p": 240, "144p": 144
         }
         res_str = p.get('res_choice', 'Original')
-        target_h = res_map.get(res_str, orig_h)
+        target_h = res_map.get(res_str, orig_h if orig_h else 1080) if orig_h else 1080
         ar_str = p.get('ar_choice', 'Original')
 
         # --- Bitrate & Scaling Logic ---
         video_kbps = 0
         forced_av1 = False
         force_mitchell = False
+        safety_margin = 0.95  # Initialize safety margin for all modes
 
         if mode == 'size':
             if duration <= 0:
@@ -499,6 +505,7 @@ class EncoderWorker(QThread):
             self.log_signal.emit(f"Mode: CQP {crf_value}")
 
         # --- Width Calculation ---
+        target_w = target_h  # Initialize target_w with target_h as fallback
         if ar_str in ["Original", "Auto"]:
             if orig_h == 0:
                 self.log_signal.emit("Error: Invalid original height for aspect ratio calculation.")
@@ -959,7 +966,7 @@ class HWDeviceProber(QThread):
         super().__init__()
         self.ffmpeg_path = ffmpeg_path if ffmpeg_path else 'ffmpeg'
         self.device_path = device_path
-        self.capabilities = {'av1': False, 'h264': False, 'hevc': False}
+        self.capabilities: dict = {'av1': False, 'h264': False, 'hevc': False, 'gpu_vendor': 'unknown'}
         self.log_messages = []
     
     def detect_gpu_vendor(self):
@@ -1554,7 +1561,12 @@ class MainWindow(QMainWindow):
             }
         """)
         
+        self.time_label = QLabel("00:00:00")
+        self.time_label.setStyleSheet("color: white; font-family: monospace; font-weight: bold;")
+        self.time_label.setMinimumWidth(70)
+        
         progress_layout.addWidget(self.progress_bar)
+        progress_layout.addWidget(self.time_label)
         layout.addWidget(progress_container)
         
         # --- BUTTONS ---
@@ -2344,6 +2356,13 @@ class MainWindow(QMainWindow):
 
         # Reset progress bar for new job
         self.progress_bar.setValue(0)
+        
+        # Start timer for this job
+        self.job_start_time = time.time()
+        self.time_label.setText("00:00:00")
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.update_elapsed_time)
+        self.timer.start(1000)  # Update every second
 
         self.worker = EncoderWorker(current_job_params)
         self.worker.log_signal.connect(self.log.append)
@@ -2352,10 +2371,23 @@ class MainWindow(QMainWindow):
         self.worker.compatibility_warning_signal.connect(self.show_compatibility_warning)
         self.worker.progress_signal.connect(self.update_progress)
         self.worker.start()
+    
+    def update_elapsed_time(self):
+        """Update the elapsed time display"""
+        if hasattr(self, 'job_start_time'):
+            elapsed = time.time() - self.job_start_time
+            hours = int(elapsed // 3600)
+            minutes = int((elapsed % 3600) // 60)
+            seconds = int(elapsed % 60)
+            self.time_label.setText(f"{hours:02d}:{minutes:02d}:{seconds:02d}")
 
     def job_finished(self, success):
         if success: self.log.append(">>> JOB FINISHED SUCCESSFULLY")
         else: self.log.append(">>> JOB FAILED or CANCELLED")
+
+        # Stop the timer
+        if hasattr(self, 'timer'):
+            self.timer.stop()
 
         # Access is_cancelled with proper thread synchronization
         with self.worker._process_lock:
