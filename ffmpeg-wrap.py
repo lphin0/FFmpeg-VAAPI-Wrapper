@@ -63,7 +63,7 @@ class EncoderWorker(QThread):
             self.process = None
 
     def get_video_info(self, filepath):
-        if self.is_cancelled: return None, 0, 0, "", 0, ""
+        if self.is_cancelled: return None, 0, 0, "", 0, "", [], []
 
         cmd = [
             self.ffprobe_path,
@@ -88,13 +88,22 @@ class EncoderWorker(QThread):
             w = int(video_stream.get('width', 0) or 0)
             h = int(video_stream.get('height', 0) or 0)
             codec = video_stream.get('codec_name', 'unknown') or 'unknown'
-            audio_count = sum(1 for s in data.get('streams', []) if s.get('codec_type') == 'audio')
-            
-            # Get first audio codec name
-            audio_codec = ""
+
             audio_streams = [s for s in data.get('streams', []) if s.get('codec_type') == 'audio']
-            if audio_streams:
-                audio_codec = audio_streams[0].get('codec_name', 'unknown') or 'unknown'
+            decodable_audio_indices = []
+            audio_codec = ""
+
+            for i, s in enumerate(audio_streams):
+                c_name = (s.get('codec_name') or '').strip().lower()
+                if c_name and c_name not in ('unknown', 'none'):
+                    decodable_audio_indices.append(i)
+                    if not audio_codec:
+                        audio_codec = s.get('codec_name', '') or ''
+
+            audio_count = len(decodable_audio_indices)
+            if audio_count < len(audio_streams):
+                skipped = len(audio_streams) - audio_count
+                self.log_signal.emit(f"Notice: Skipping {skipped} audio stream(s) with unsupported codec.")
 
             dur = None
             if 'format' in data and 'duration' in data['format']:
@@ -113,14 +122,14 @@ class EncoderWorker(QThread):
                 self.log_signal.emit("Warning: Duration metadata missing.")
                 dur = 0.0
 
-            return dur, w, h, codec, audio_count, audio_codec
+            return dur, w, h, codec, audio_count, audio_codec, decodable_audio_indices
 
         except subprocess.CalledProcessError as e:
             self.log_signal.emit(f"FFprobe Error: {e.output.decode().strip()}")
-            return None, 0, 0, "", 0, ""
+            return None, 0, 0, "", 0, "", []
         except Exception as e:
             self.log_signal.emit(f"Probe Parse Exception: {str(e)}")
-            return None, 0, 0, "", 0, ""
+            return None, 0, 0, "", 0, "", []
 
     def run_ffmpeg_process(self, cmd, pass_name=""):
         if self.is_cancelled: return False
@@ -240,7 +249,7 @@ class EncoderWorker(QThread):
         use_hw = p.get('use_hw', True)
         selected_codec = p['v_codec']
 
-        duration, orig_w, orig_h, input_codec, audio_count, audio_codec = self.get_video_info(input_file)
+        duration, orig_w, orig_h, input_codec, audio_count, audio_codec, decodable_audio_indices = self.get_video_info(input_file)
         self.video_duration = duration if duration else 0.0
 
         if orig_w == 0 or orig_h == 0:
@@ -576,7 +585,9 @@ class EncoderWorker(QThread):
 
         # --- Build Pipeline ---
         base_cmd = ["ffmpeg", "-hide_banner", "-y"]
-        map_flags = ["-map", "0:v:0", "-map", "0:a"]
+        map_flags = ["-map", "0:v:0"]
+        for idx in decodable_audio_indices:
+            map_flags.extend(["-map", f"0:a:{idx}"])
         meta_subs_flags = []
         is_mp4_container = (ext == ".mp4")
 
@@ -762,21 +773,22 @@ class EncoderWorker(QThread):
                     self.log_signal.emit(f"Metadata: Cropping padding (Right:{pad_right}, Bottom:{pad_bottom}) for HEVC.")
                     video_flags.extend(["-bsf:v", f"hevc_metadata=crop_right={pad_right}:crop_bottom={pad_bottom}"])
 
-        if mode == 'size':
-            video_flags.extend(["-b:v", f"{video_kbps}k"])
-            if not is_av1 and not is_vp9:
-                video_flags.extend(["-maxrate", f"{video_kbps}k", "-bufsize", f"{video_kbps*2}k"])
-        else:
-            crf_val = str(p.get('crf', 24))
-            if is_av1:
-                video_flags.extend(["-crf", crf_val, "-b:v", "0"])
-            elif is_vp9:
-                video_flags.extend(["-crf", crf_val, "-b:v", "0"])
+        if video_codec_cmd != "copy":
+            if mode == 'size':
+                video_flags.extend(["-b:v", f"{video_kbps}k"])
+                if not is_av1 and not is_vp9:
+                    video_flags.extend(["-maxrate", f"{video_kbps}k", "-bufsize", f"{video_kbps*2}k"])
             else:
-                if use_hw:
-                    video_flags.extend(["-rc_mode", "CQP", "-qp", crf_val])
+                crf_val = str(p.get('crf', 24))
+                if is_av1:
+                    video_flags.extend(["-crf", crf_val, "-b:v", "0"])
+                elif is_vp9:
+                    video_flags.extend(["-crf", crf_val, "-b:v", "0"])
                 else:
-                    video_flags.extend(["-crf", crf_val])
+                    if use_hw:
+                        video_flags.extend(["-rc_mode", "CQP", "-qp", crf_val])
+                    else:
+                        video_flags.extend(["-crf", crf_val])
 
         # --- Execute ---
         # VP9 supports 2-pass encoding
@@ -1194,6 +1206,39 @@ class NotificationManager:
             pass
         
         return False
+    
+    def _play_failure_chime(self):
+        try:
+            tone1 = self._generate_tone(1108.73, 0.1, 0.25)
+            tone2 = self._generate_tone(1108.73, 0.1, 0.25)
+            tone3 = self._generate_tone(440, 0.2, 0.25)
+            
+            audio_data = tone1 + tone2 + tone3
+            
+            if self.has_paplay:
+                proc = subprocess.Popen([
+                    'paplay', '--raw', '--format=s16le',
+                    '--channels=1', '--rate=44100'
+                ], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                proc.communicate(input=audio_data)
+                return True
+            
+            elif self.has_aplay:
+                proc = subprocess.Popen([
+                    'aplay', '-q', '-f', 'cd', '-c', '1'
+                ], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                proc.communicate(input=audio_data)
+                return True
+            
+        except Exception:
+            pass
+        
+        return False
+    
+    def notify_failure(self):
+        if self._play_failure_chime():
+            return
+        print('\a', end='', flush=True)
     
     def notify_completion(self, message="Encoding completed successfully", show_popup=True, play_sound=True):
         """Play pleasant chime and show notification"""
@@ -2392,6 +2437,9 @@ class MainWindow(QMainWindow):
         # Access is_cancelled with proper thread synchronization
         with self.worker._process_lock:
             was_cancelled = self.worker.is_cancelled
+        
+        if not success and not was_cancelled and not self.chk_no_sound.isChecked():
+            self.notification_manager.notify_failure()
         
         if not was_cancelled:
             # Get the file path before removing the item
