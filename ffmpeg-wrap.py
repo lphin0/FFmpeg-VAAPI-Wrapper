@@ -1460,6 +1460,8 @@ class MainWindow(QMainWindow):
         self.hw_device_prober = None
         self.hw_decoder_checker = None
         self.hw_encoder_check_complete = False
+        self._probing_active = True
+        self._initial_probing_done = False
         
         self.probing_coordinator = ProbingCoordinator()
 
@@ -1826,16 +1828,15 @@ class MainWindow(QMainWindow):
         self.mode_combo.setMinimumWidth(140)
         # Match Audio Bitrate widget width to Audio Codec width
         self.bitrate_widget.setFixedWidth(self.a_codec.sizeHint().width())
-        # Match Resolution and Aspect Ratio dropdowns to Scaling dropdown width
         self.res_combo.setFixedWidth(self.algo_combo.sizeHint().width())
         self.ar_combo.setFixedWidth(self.algo_combo.sizeHint().width())
 
-        # Schedule background initialization tasks after window is shown
-        # This prevents UI blocking during device probing and encoder checking
+        self._set_ui_enabled(False)
+        
         QTimer.singleShot(100, self.check_sw_encoders)
         QTimer.singleShot(150, self.check_audio_encoders)
         QTimer.singleShot(200, self.initial_probe)
-        QTimer.singleShot(0, self.update_queue_placeholder)  # Initialize placeholder visibility
+        QTimer.singleShot(0, self.update_queue_placeholder)
         
         self.worker = None
 
@@ -1933,34 +1934,31 @@ class MainWindow(QMainWindow):
         self.available_sw_codecs = available_codecs
         self.update_codec_options()
         self.sw_encoder_checker = None
+        self._check_probing_complete()
     
     def on_audio_encoders_found(self, available_encoders):
         """Handle completion of audio encoder checking"""
         self.available_audio_encoders = available_encoders
         self.audio_encoder_checker = None
+        self._check_probing_complete()
     
     def on_device_encoders_found(self, device_path, capabilities):
         """Handle completion of hardware encoder probing"""
         self.device_capabilities[device_path] = capabilities
         self.hw_device_prober = None
         self.hw_encoder_check_complete = True
+        self._check_probing_complete()
         
-        # Check if both encoder and decoder checks are complete
         if self.hw_encoder_check_complete and self.hw_decoder_checker is None:
-            # All checks done, refresh UI
             self.update_codec_ui(self.v_codec.currentText())
     
     def on_device_decoders_found(self, device_path, decoder_caps):
         """Handle completion of hardware decoder probing"""
         self.hw_decoder_capabilities[device_path] = decoder_caps
         self.hw_decoder_checker = None
+        self._check_probing_complete()
         
-        # Check if ProRes Vulkan decode is available
-        prores_vulkan = decoder_caps.get('prores', False)
-        
-        # Check if both encoder and decoder checks are complete
         if self.hw_encoder_check_complete and self.hw_decoder_checker is None:
-            # All checks done, refresh UI
             self.update_codec_ui(self.v_codec.currentText())
     
     def on_vulkan_found(self, has_vulkan, capabilities):
@@ -1968,15 +1966,54 @@ class MainWindow(QMainWindow):
         self.vulkan_available = has_vulkan
         self.vulkan_capabilities = capabilities
         self.vulkan_prober = None
+        self._check_probing_complete()
         
-        # Only log if Vulkan ProRes decode is available
         if has_vulkan:
             self.log.append("ProRes Vulkan hardware decode available")
-        # Update tooltip
         if has_vulkan:
             self.chk_hw_decode.setToolTip("Use Vulkan hardware decoding for ProRes inputs")
         else:
             self.chk_hw_decode.setToolTip("Vulkan ProRes decode not available - will use CPU decode for ProRes")
+    
+    def _set_ui_enabled(self, enabled):
+        """Enable or disable UI during probing"""
+        self.btn_start.setEnabled(enabled)
+        self.btn_add_queue.setEnabled(enabled)
+        self.btn_rem_queue.setEnabled(enabled)
+        self.btn_clear_queue.setEnabled(enabled)
+        self.chk_hw_decode.setEnabled(enabled)
+        if hasattr(self, 'device_combo'):
+            self.device_combo.setEnabled(enabled and len(glob.glob("/dev/dri/renderD*")) > 1)
+    
+    def _set_encoding_ui_enabled(self, enabled):
+        """Enable or disable UI during encoding (keeps cancel and notification checkboxes enabled)"""
+        self.btn_start.setEnabled(enabled)
+        self.btn_add_queue.setEnabled(enabled)
+        self.btn_rem_queue.setEnabled(enabled)
+        self.btn_clear_queue.setEnabled(enabled)
+        self.queue_list.setEnabled(enabled)
+        self.btn_cancel.setEnabled(not enabled)
+        
+        if enabled:
+            self.release_sleep()
+    
+    def _check_probing_complete(self):
+        """Check if all probing is complete and re-enable UI"""
+        if not self._probing_active:
+            return
+        
+        sw_done = self.sw_encoder_checker is None
+        audio_done = self.audio_encoder_checker is None
+        hw_enc_done = self.hw_device_prober is None
+        hw_dec_done = self.hw_decoder_checker is None
+        vulkan_done = self.vulkan_prober is None or not hasattr(self, '_vulkan_probed')
+        
+        if sw_done and audio_done and hw_enc_done and hw_dec_done and vulkan_done:
+            self._probing_active = False
+            self._set_ui_enabled(True)
+            if not self._initial_probing_done:
+                self._initial_probing_done = True
+                self.log.append("System probing complete.")
     
     def on_encoder_warning(self, title, message):
         """Show warning message from encoder checker"""
@@ -2495,13 +2532,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Queue", "Queue is empty.")
             return
 
-        self.btn_start.setEnabled(False)
-        self.btn_cancel.setEnabled(True)
-        self.btn_add_queue.setEnabled(False)
-        self.btn_rem_queue.setEnabled(False)
-        self.btn_clear_queue.setEnabled(False)
-        self.queue_list.setEnabled(False)
-
+        self._set_encoding_ui_enabled(False)
         self.inhibit_sleep()
 
         # Validate and reset empty values to defaults
@@ -2697,14 +2728,8 @@ class MainWindow(QMainWindow):
             self.notification_manager.notify_completion(message, show_popup=True, play_sound=False)
 
     def reset_ui(self):
-        self.release_sleep()
-        self.btn_start.setEnabled(True)
-        self.btn_cancel.setEnabled(False)
-        self.btn_add_queue.setEnabled(True)
-        self.btn_rem_queue.setEnabled(True)
-        self.btn_clear_queue.setEnabled(True)
-        self.queue_list.setEnabled(True)
-        self.progress_bar.setValue(0)  # Reset progress bar
+        self._set_encoding_ui_enabled(True)
+        self.progress_bar.setValue(0)
 
     def cancel(self):
         if self.worker and self.worker.isRunning():
