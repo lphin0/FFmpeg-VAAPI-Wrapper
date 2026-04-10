@@ -1674,14 +1674,14 @@ class MainWindow(QMainWindow):
         output_font = QApplication.font()
         output_font.setPointSizeF(output_font.pointSizeF() - 2)
         self.output_path.setFont(output_font)
-        btn_out_browse = QPushButton("Browse")
-        btn_out_browse.clicked.connect(self.browse_output_folder)
+        self.btn_out_browse = QPushButton("Browse")
+        self.btn_out_browse.clicked.connect(self.browse_output_folder)
 
         out_layout.addWidget(QLabel("Format:"))
         out_layout.addWidget(self.container_combo)
         out_layout.addWidget(QLabel("Destination:"))
         out_layout.addWidget(self.output_path)
-        out_layout.addWidget(btn_out_browse)
+        out_layout.addWidget(self.btn_out_browse)
         layout.addLayout(out_layout)
 
         # --- CREATE TWO-COLUMN LAYOUT ---
@@ -1710,11 +1710,11 @@ class MainWindow(QMainWindow):
         self.ffmpeg_path.setToolTip("Leave empty to use system default FFmpeg")
         self.ffmpeg_path.editingFinished.connect(self.on_ffmpeg_path_changed)
         
-        ffmpeg_browse_btn = QPushButton("Browse")
-        ffmpeg_browse_btn.clicked.connect(self.browse_ffmpeg)
+        self.ffmpeg_browse_btn = QPushButton("Browse")
+        self.ffmpeg_browse_btn.clicked.connect(self.browse_ffmpeg)
         
         ffmpeg_layout.addWidget(self.ffmpeg_path)
-        ffmpeg_layout.addWidget(ffmpeg_browse_btn)
+        ffmpeg_layout.addWidget(self.ffmpeg_browse_btn)
         misc_layout.addLayout(ffmpeg_layout)
 
         self.chk_copy_data = QCheckBox("Copy Subtitles and Metadata")
@@ -2047,6 +2047,27 @@ class MainWindow(QMainWindow):
         self.btn_rem_queue.setEnabled(enabled)
         self.btn_clear_queue.setEnabled(enabled)
         self.chk_hw_decode.setEnabled(enabled)
+        self.mode_combo.setEnabled(enabled)
+        self.v_codec.setEnabled(enabled)
+        self.chk_hw.setEnabled(enabled)
+        self.chk_2pass.setEnabled(enabled)
+        self.quality_combo.setEnabled(enabled)
+        self.container_combo.setEnabled(enabled)
+        self.output_path.setEnabled(enabled)
+        self.btn_out_browse.setEnabled(enabled)
+        self.ffmpeg_path.setEnabled(enabled)
+        self.ffmpeg_browse_btn.setEnabled(enabled)
+        self.chk_copy_data.setEnabled(enabled)
+        self.res_combo.setEnabled(enabled)
+        self.ar_combo.setEnabled(enabled)
+        self.fps_combo.setEnabled(enabled)
+        self.fps_custom_input.setEnabled(enabled)
+        self.algo_combo.setEnabled(enabled)
+        self.chk_auto_scale.setEnabled(enabled)
+        self.a_codec.setEnabled(enabled)
+        self.a_bitrate.setEnabled(enabled)
+        self.target_size.setEnabled(enabled)
+        self.q_spin.setEnabled(enabled)
         if hasattr(self, 'device_combo'):
             self.device_combo.setEnabled(enabled and len(glob.glob("/dev/dri/renderD*")) > 1)
     
@@ -2058,6 +2079,30 @@ class MainWindow(QMainWindow):
         self.btn_clear_queue.setEnabled(enabled)
         self.queue_list.setEnabled(enabled)
         self.btn_cancel.setEnabled(not enabled)
+        self.mode_combo.setEnabled(enabled)
+        self.v_codec.setEnabled(enabled)
+        self.chk_hw.setEnabled(enabled)
+        self.chk_2pass.setEnabled(enabled)
+        self.quality_combo.setEnabled(enabled)
+        self.container_combo.setEnabled(enabled)
+        self.output_path.setEnabled(enabled)
+        self.btn_out_browse.setEnabled(enabled)
+        self.ffmpeg_path.setEnabled(enabled)
+        self.ffmpeg_browse_btn.setEnabled(enabled)
+        self.chk_copy_data.setEnabled(enabled)
+        self.res_combo.setEnabled(enabled)
+        self.ar_combo.setEnabled(enabled)
+        self.fps_combo.setEnabled(enabled)
+        self.fps_custom_input.setEnabled(enabled)
+        self.algo_combo.setEnabled(enabled)
+        self.chk_auto_scale.setEnabled(enabled)
+        self.a_codec.setEnabled(enabled)
+        self.a_bitrate.setEnabled(enabled)
+        self.target_size.setEnabled(enabled)
+        self.q_spin.setEnabled(enabled)
+        self.chk_hw_decode.setEnabled(enabled)
+        if hasattr(self, 'device_combo'):
+            self.device_combo.setEnabled(enabled and len(glob.glob("/dev/dri/renderD*")) > 1)
         
         if enabled:
             self.release_sleep()
@@ -2325,6 +2370,12 @@ class MainWindow(QMainWindow):
         use_hw = self.chk_hw.isChecked()
         is_av1 = "AV1" in codec
         is_vp9 = "VP9" in codec
+        
+        # Check GPU vendor for AMD-specific VCN compression levels
+        current_device = self.device_combo.currentText()
+        hw_caps = self.hw_decoder_capabilities.get(current_device, {})
+        gpu_vendor = hw_caps.get('gpu_vendor', 'unknown')
+        is_amd = gpu_vendor == 'amd'
 
         self.quality_combo.clear()
 
@@ -2361,11 +2412,21 @@ class MainWindow(QMainWindow):
                 self.quality_combo.addItem(desc, value)
             self.quality_combo.setCurrentIndex(4)
         elif use_hw:
-            self.quality_combo.addItem("Quality (Best)", 1)
-            self.quality_combo.addItem("Balanced (Default)", 2)
-            self.quality_combo.addItem("Speed (Fast)", 4)
-            self.quality_combo.addItem("Max Speed", 7)
-            self.quality_combo.setCurrentIndex(0)
+            # VCN compression levels are AMD-specific
+            # For non-AMD GPUs, disable speed preset options
+            if is_amd:
+                self.quality_combo.addItem("Quality (Best)", 1)
+                self.quality_combo.addItem("Balanced (Default)", 2)
+                self.quality_combo.addItem("Speed (Fast)", 4)
+                self.quality_combo.addItem("Max Speed", 7)
+                self.quality_combo.setCurrentIndex(0)
+                self.quality_combo.setEnabled(True)
+            else:
+                # Non-AMD GPU: VCN compression levels not supported
+                # Use balanced default, disable the combo
+                self.quality_combo.addItem("Balanced (Default)", 2)
+                self.quality_combo.setCurrentIndex(0)
+                self.quality_combo.setEnabled(False)
         else:
             presets = [
                 ("veryslow", 0), ("slower", 1), ("slow", 2), ("medium", 3),
