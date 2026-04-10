@@ -1201,9 +1201,35 @@ class HWDecoderChecker(QThread):
         super().__init__()
         self.ffmpeg_path = ffmpeg_path if ffmpeg_path else 'ffmpeg'
         self.device_path = device_path
-        self.decoder_caps = {'h264': False, 'hevc': False, 'vp8': False, 'vp9': False, 'av1': False, 'mpeg2video': False}
+        self.decoder_caps = {'h264': False, 'hevc': False, 'vp8': False, 'vp9': False, 'av1': False, 'mpeg2video': False, 'gpu_vendor': 'unknown'}
         self.log_messages = []
         self.prober_id = 'hw_decoders'
+    
+    def detect_gpu_vendor(self):
+        """Detect GPU vendor from DRI device path"""
+        try:
+            device_num = self.device_path.split('renderD')[-1]
+            vendor_path = f"/sys/class/drm/renderD{device_num}/device/vendor"
+            if os.path.exists(vendor_path):
+                with open(vendor_path, 'r') as f:
+                    vendor_id = f.read().strip()
+                    if vendor_id.lower() == '0x8086':
+                        return 'intel'
+                    elif vendor_id.lower() in ['0x1002', '0x1022']:
+                        return 'amd'
+            
+            card_path = f"/sys/class/drm/renderD{device_num}"
+            if os.path.exists(card_path):
+                device_link = os.path.realpath(f"{card_path}/device")
+                if 'i915' in device_link.lower():
+                    return 'intel'
+                elif 'amdgpu' in device_link.lower() or 'radeon' in device_link.lower():
+                    return 'amd'
+            
+            return 'unknown'
+        except Exception as e:
+            self.log_messages.append(f"Warning: Could not detect GPU vendor: {e}")
+            return 'unknown'
     
     def _probe_decoder(self, dec_codec):
         cmd = [
@@ -1225,6 +1251,10 @@ class HWDecoderChecker(QThread):
             return dec_codec, False, str(e)
     
     def run(self):
+        # Detect GPU vendor first
+        gpu_vendor = self.detect_gpu_vendor()
+        self.decoder_caps['gpu_vendor'] = gpu_vendor
+        self.log_messages.append(f"  Hardware Device: {self.device_path} (GPU: {gpu_vendor.upper()})")
         self.log_messages.append(f"  Hardware decoder support (VAAPI):")
         
         decoder_codecs = ['h264', 'hevc', 'vp8', 'vp9', 'av1', 'mpeg2video']
@@ -1251,7 +1281,7 @@ class HWDecoderChecker(QThread):
         except Exception as e:
             self.log_messages.append(f"Error probing device: {str(e)}")
             self.warning_signal.emit(f"Could not verify capabilities for {self.device_path}. All codecs enabled (Use at your own risk).")
-            self.decoder_caps = {'h264': True, 'hevc': True, 'vp8': True, 'vp9': True, 'av1': True, 'mpeg2video': True}
+            self.decoder_caps = {'h264': True, 'hevc': True, 'vp8': True, 'vp9': True, 'av1': True, 'mpeg2video': True, 'gpu_vendor': gpu_vendor}
             self.log_signal.emit('\n'.join(self.log_messages))
             self.finished_signal.emit(self.device_path, self.decoder_caps)
             return
@@ -1259,7 +1289,7 @@ class HWDecoderChecker(QThread):
         if ffmpeg_not_found:
             self.log_messages.append("Error: FFmpeg not found. Cannot verify hardware capabilities.")
             self.warning_signal.emit("FFmpeg executable not found. All codec options enabled (Use at your own risk).")
-            self.decoder_caps = {'h264': True, 'hevc': True, 'vp8': True, 'vp9': True, 'av1': True, 'mpeg2video': True}
+            self.decoder_caps = {'h264': True, 'hevc': True, 'vp8': True, 'vp9': True, 'av1': True, 'mpeg2video': True, 'gpu_vendor': 'unknown'}
         
         self.log_signal.emit('\n'.join(self.log_messages))
         self.finished_signal.emit(self.device_path, self.decoder_caps)
