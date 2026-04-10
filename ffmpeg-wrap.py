@@ -636,41 +636,43 @@ class EncoderWorker(QThread):
             # Vulkan hwaccel decode for ProRes
             use_vulkan_decode = is_prores and use_hw_decode and vulkan_available
 
+            if is_av1 and "av1_vaapi" in video_codec_cmd:
+                pix_fmt = "yuv420p10le"
+            else:
+                pix_fmt = "nv12"
+
             if use_vulkan_decode:
-                if not can_hw_decode:
-                    self.log_signal.emit(f"Notice: ProRes codec detected. Using Vulkan HW Decode (shader-based).")
-
-                if is_av1 and "av1_vaapi" in video_codec_cmd:
-                    pix_fmt = "yuv420p10le"
-                else:
-                    pix_fmt = "nv12"
-
+                # Vulkan decode path for ProRes
                 self.log_signal.emit(f"Pipeline: ProRes Vulkan HW Decode -> VAAPI Encode")
-                # Initialize both Vulkan and VAAPI devices
-                base_cmd.extend(["-init_hw_device", f"vulkan=vk:0"])
+                base_cmd.extend(["-init_hw_device", "vulkan"])
                 base_cmd.extend(["-init_hw_device", f"vaapi=va:{device}"])
-                base_cmd.extend(["-hwaccel", "vulkan", "-hwaccel_device", "vk", "-i", input_file])
                 base_cmd.extend(["-filter_hw_device", "va"])
-                # Vulkan outputs VULKAN pixfmt, need to download and upload for VAAPI
-                # ProRes is typically 422 10-bit
-                vf_chain.append(f"hwdownload,format=yuv422p10le,hwupload")
+                base_cmd.extend(["-hwaccel", "vulkan", "-i", input_file])
+                # hwdownload from Vulkan converts to software format
+                # ProRes is yuv422p10le, then scale and upload to VAAPI
+                scale_filters = ["hwdownload"]
+                if target_w != orig_w or target_h != orig_h:
+                    scale_filters.append(f"scale={target_w}:{target_h}:flags=bicubic")
+                scale_filters.append(f"format={pix_fmt}")
+                scale_filters.append("hwupload")
+                vf_chain.append(",".join(scale_filters))
             else:
                 # Standard VAAPI decode path
-                if not can_hw_decode and not is_prores:
-                    self.log_signal.emit(f"Notice: Codec '{input_codec}' not HW-decodable. Using CPU Decode.")
-
-                if is_av1 and "av1_vaapi" in video_codec_cmd:
-                     pix_fmt = "yuv420p10le"
-                else:
-                     pix_fmt = "nv12"
+                # ProRes is not VAAPI-decodable, use CPU decode
+                if not can_hw_decode:
+                    if is_prores:
+                        self.log_signal.emit(f"Notice: ProRes uses CPU decode (VAAPI doesn't support ProRes decode)")
+                    else:
+                        self.log_signal.emit(f"Notice: Codec '{input_codec}' not HW-decodable. Using CPU Decode.")
 
                 if is_av1 or "VAAPI" not in algo or force_mitchell:
                     use_software_scaler = True
                 else:
                     use_software_scaler = False
 
-                if use_software_scaler:
-                    self.log_signal.emit(f"Pipeline: CPU Scale -> GPU Encode")
+                if use_software_scaler or not can_hw_decode:
+                    # CPU decode -> GPU encode path
+                    self.log_signal.emit(f"Pipeline: CPU Decode -> GPU Encode")
                     base_cmd.extend(["-init_hw_device", f"vaapi=va:{device}", "-filter_hw_device", "va", "-i", input_file])
 
                     scale_filter_str = f"scale={target_w}:{target_h}:flags=bicubic"
@@ -684,15 +686,10 @@ class EncoderWorker(QThread):
                     vf_chain.append(scale_filter_str)
                     vf_chain.append(f"format={pix_fmt},hwupload")
                 else:
-                    if can_hw_decode:
-                        self.log_signal.emit(f"Pipeline: Full Hardware (VAAPI)")
-                        base_cmd.extend(["-hwaccel", "vaapi", "-hwaccel_device", device, "-hwaccel_output_format", "vaapi", "-i", input_file])
-                        vf_chain.append(f"scale_vaapi=w={target_w}:h={target_h}:format={pix_fmt}")
-                    else:
-                        self.log_signal.emit(f"Pipeline: CPU Decode -> GPU Scale/Encode")
-                        base_cmd.extend(["-init_hw_device", f"vaapi=va:{device}", "-filter_hw_device", "va", "-i", input_file])
-                        vf_chain.append(f"format={pix_fmt},hwupload")
-                        vf_chain.append(f"scale_vaapi=w={target_w}:h={target_h}:format={pix_fmt}")
+                    # Full VAAPI hardware path
+                    self.log_signal.emit(f"Pipeline: Full Hardware (VAAPI)")
+                    base_cmd.extend(["-hwaccel", "vaapi", "-hwaccel_device", device, "-hwaccel_output_format", "vaapi", "-i", input_file])
+                    vf_chain.append(f"scale_vaapi=w={target_w}:h={target_h}:format={pix_fmt}")
 
         else:
             self.log_signal.emit("Pipeline: Full Software (CPU)")
@@ -1110,35 +1107,25 @@ class HWDecoderChecker(QThread):
         super().__init__()
         self.ffmpeg_path = ffmpeg_path if ffmpeg_path else 'ffmpeg'
         self.device_path = device_path
-        self.decoder_caps = {'h264': False, 'hevc': False, 'vp8': False, 'vp9': False, 'av1': False, 'mpeg2video': False, 'prores': False}
+        self.decoder_caps = {'h264': False, 'hevc': False, 'vp8': False, 'vp9': False, 'av1': False, 'mpeg2video': False}
         self.log_messages = []
     
     def run(self):
-        self.log_messages.append(f"  Hardware decoder support:")
+        self.log_messages.append(f"  Hardware decoder support (VAAPI):")
         error_occurred = False
         
-        decoder_codecs = ['h264', 'hevc', 'vp8', 'vp9', 'av1', 'mpeg2video', 'prores']
+        decoder_codecs = ['h264', 'hevc', 'vp8', 'vp9', 'av1', 'mpeg2video']
         
         try:
             for dec_codec in decoder_codecs:
-                # ProRes uses Vulkan hwaccel, others use VAAPI
-                if dec_codec == 'prores':
-                    cmd = [
-                        self.ffmpeg_path, "-y", "-hide_banner",
-                        "-hwaccel", "vulkan",
-                        "-f", "lavfi", "-i", "nullsrc=duration=1:size=320x240:rate=1",
-                        "-c:v", "rawvideo",
-                        "-f", "null", "-"
-                    ]
-                else:
-                    cmd = [
-                        self.ffmpeg_path, "-y", "-hide_banner",
-                        "-hwaccel", "vaapi",
-                        "-hwaccel_device", self.device_path,
-                        "-f", "lavfi", "-i", "nullsrc=duration=1:size=320x240:rate=1",
-                        "-c:v", "rawvideo",
-                        "-f", "null", "-"
-                    ]
+                cmd = [
+                    self.ffmpeg_path, "-y", "-hide_banner",
+                    "-hwaccel", "vaapi",
+                    "-hwaccel_device", self.device_path,
+                    "-f", "lavfi", "-i", "nullsrc=duration=1:size=320x240:rate=1",
+                    "-c:v", "rawvideo",
+                    "-f", "null", "-"
+                ]
                 
                 try:
                     result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
@@ -1164,7 +1151,7 @@ class HWDecoderChecker(QThread):
             error_occurred = True
         
         if error_occurred:
-            self.decoder_caps = {'h264': True, 'hevc': True, 'vp8': True, 'vp9': True, 'av1': True, 'mpeg2video': True, 'prores': False, 'gpu_vendor': 'unknown'}
+            self.decoder_caps = {'h264': True, 'hevc': True, 'vp8': True, 'vp9': True, 'av1': True, 'mpeg2video': True, 'gpu_vendor': 'unknown'}
         
         # Emit all log messages as one consolidated message
         self.log_signal.emit('\n'.join(self.log_messages))
@@ -1180,18 +1167,17 @@ class VulkanDeviceProber(QThread):
     def __init__(self, ffmpeg_path):
         super().__init__()
         self.ffmpeg_path = ffmpeg_path if ffmpeg_path else 'ffmpeg'
-        self.vulkan_capabilities = {'prores_vulkan': False, 'device_index': 0}
+        self.vulkan_capabilities = {'vulkan_available': False, 'prores_vulkan': False}
         self.log_messages = []
     
     def run(self):
-        self.log_messages.append("Probing Vulkan hwaccel support...")
-        error_occurred = False
-        
         try:
+            # First check if Vulkan hwaccel is available at all
             cmd = [
-                self.ffmpeg_path, "-y", "-hide_banner",
-                "-init_hw_device", "vulkan=vk:0",
-                "-f", "lavfi", "-i", "nullsrc=duration=1:size=320x240:rate=1",
+                self.ffmpeg_path, "-hide_banner",
+                "-init_hw_device", "vulkan",
+                "-f", "lavfi", "-i", "nullsrc=duration=0.1:size=320x240:rate=1",
+                "-frames:v", "1",
                 "-f", "null", "-"
             ]
             
@@ -1199,53 +1185,37 @@ class VulkanDeviceProber(QThread):
             
             if result.returncode == 0:
                 self.vulkan_capabilities['vulkan_available'] = True
-                self.log_messages.append("  -> Vulkan device: Available")
                 
-                cmd_prores = [
-                    self.ffmpeg_path, "-y", "-hide_banner",
-                    "-init_hw_device", "vulkan=vk:0",
-                    "-hwaccel", "vulkan",
-                    "-f", "lavfi", "-i", "nullsrc=duration=1:size=320x240:rate=1",
-                    "-f", "null", "-"
-                ]
+                # Check for prores_vulkan decoder (requires patched FFmpeg)
+                decoders_cmd = [self.ffmpeg_path, "-decoders"]
+                decoders_result = subprocess.run(decoders_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
                 
-                result_prores = subprocess.run(cmd_prores, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
-                
-                if result_prores.returncode == 0:
-                    self.vulkan_capabilities['prores_vulkan'] = True
-                    self.log_messages.append("  -> ProRes Vulkan hwaccel: Supported")
-                else:
-                    self.vulkan_capabilities['prores_vulkan'] = False
-                    self.log_messages.append("  -> ProRes Vulkan hwaccel: Not Supported")
+                if decoders_result.returncode == 0:
+                    decoders_output = decoders_result.stdout.decode()
+                    # Look for prores_vulkan decoder
+                    if 'prores_vulkan' in decoders_output:
+                        self.vulkan_capabilities['prores_vulkan'] = True
+                        self.log_messages.append("  -> ProRes Vulkan decode: Supported")
+                    else:
+                        self.log_messages.append("  -> ProRes Vulkan decode: Not available")
             else:
                 self.vulkan_capabilities['vulkan_available'] = False
                 self.vulkan_capabilities['prores_vulkan'] = False
-                stderr_text = result.stderr.decode()
-                if "vulkan" in stderr_text.lower() or "Vulkan" in stderr_text:
-                    self.log_messages.append("  -> Vulkan hwaccel: Not available in FFmpeg")
-                else:
-                    self.log_messages.append("  -> Vulkan hwaccel: Not Supported")
-                    
-        except subprocess.TimeoutExpired:
-            self.vulkan_capabilities['vulkan_available'] = False
-            self.vulkan_capabilities['prores_vulkan'] = False
-            self.log_messages.append("  -> Vulkan probe: Timeout (not available)")
-            error_occurred = True
+        
         except FileNotFoundError:
             self.vulkan_capabilities['vulkan_available'] = False
             self.vulkan_capabilities['prores_vulkan'] = False
-            self.log_messages.append("Error: FFmpeg not found.")
             self.warning_signal.emit("FFmpeg executable not found.")
-            error_occurred = True
-        except Exception as e:
+        except subprocess.TimeoutExpired:
             self.vulkan_capabilities['vulkan_available'] = False
             self.vulkan_capabilities['prores_vulkan'] = False
-            self.log_messages.append(f"Error probing Vulkan: {str(e)}")
-            error_occurred = True
+        except Exception:
+            self.vulkan_capabilities['vulkan_available'] = False
+            self.vulkan_capabilities['prores_vulkan'] = False
         
-        self.log_signal.emit('\n'.join(self.log_messages))
+        self.log_signal.emit('\n'.join(self.log_messages) if self.log_messages else "")
         self.finished_signal.emit(
-            self.vulkan_capabilities.get('vulkan_available', False),
+            self.vulkan_capabilities.get('prores_vulkan', False),
             self.vulkan_capabilities
         )
 
@@ -1926,12 +1896,14 @@ class MainWindow(QMainWindow):
         self.vulkan_capabilities = capabilities
         self.vulkan_prober = None
         
-        # Update HW Decode checkbox tooltip based on availability
+        # Only log if Vulkan ProRes decode is available
         if has_vulkan:
-            self.log.append("Vulkan hwaccel available for ProRes decode")
+            self.log.append("ProRes Vulkan hardware decode available")
+        # Update tooltip
+        if has_vulkan:
             self.chk_hw_decode.setToolTip("Use Vulkan hardware decoding for ProRes inputs")
         else:
-            self.chk_hw_decode.setToolTip("Vulkan not available - HW Decode will use software fallback for ProRes")
+            self.chk_hw_decode.setToolTip("Vulkan ProRes decode not available - will use CPU decode for ProRes")
     
     def on_encoder_warning(self, title, message):
         """Show warning message from encoder checker"""
