@@ -697,49 +697,84 @@ class EncoderWorker(QThread):
                     else:
                         self.log_signal.emit(f"Notice: Codec '{input_codec}' not HW-decodable. Using CPU Decode.")
 
-                if is_av1 or "VAAPI" not in algo or force_mitchell:
-                    use_software_scaler = True
-                else:
-                    use_software_scaler = False
+                # Determine scaling approach based on user selection and codec
+                use_software_scaler = (
+                    is_av1 or               # AV1 encoding needs special format handling
+                    algo != "VAAPI (HW)" or # User explicitly selected software scaling algorithm
+                    force_mitchell          # Auto-downscale forced Mitchell algorithm
+                )
 
                 if use_software_scaler or not can_hw_decode:
-                    # CPU decode -> GPU encode path
-                    self.log_signal.emit(f"Pipeline: CPU Decode -> GPU Encode")
-                    base_cmd.extend(["-init_hw_device", f"vaapi=va:{device}", "-filter_hw_device", "va", "-i", input_file])
-
-                    scale_filter_str = f"scale={target_w}:{target_h}:flags=bicubic"
-                    if force_mitchell:
-                        scale_filter_str = f"scale={target_w}:{target_h}:flags=bicubic:param0=0.333:param1=0.333"
-                    elif "Lanczos" in algo:
-                        scale_filter_str = f"scale={target_w}:{target_h}:flags=lanczos"
-                    elif "Nearest" in algo:
-                        scale_filter_str = f"scale={target_w}:{target_h}:flags=neighbor"
-
-                    vf_chain.append(scale_filter_str)
-                    vf_chain.append(f"format={pix_fmt},hwupload")
+                    # Use Wiki Method #1: CPU decode + format + hwupload
+                    self.log_signal.emit("Pipeline: CPU Decode -> VAAPI Upload -> Encode")
+                    base_cmd.extend(["-vaapi_device", device, "-i", input_file])
+                    
+                    # Conditional scaling (only when resolution changes)
+                    if target_w != orig_w or target_h != orig_h:
+                        if algo == "VAAPI (HW)" and not use_software_scaler:
+                            # User wants VAAPI scaling but couldn't use HW decode path
+                            # Scale on GPU after upload: format -> hwupload -> scale_vaapi
+                            vf_chain.append(f"format={pix_fmt}")
+                            vf_chain.append("hwupload")
+                            vf_chain.append(f"scale_vaapi=w={target_w}:h={target_h}:format={pix_fmt}")
+                        else:
+                            # Software scaling before upload
+                            scale_filter_str = f"scale={target_w}:{target_h}:flags=bicubic"
+                            if force_mitchell:
+                                scale_filter_str = f"scale={target_w}:{target_h}:flags=bicubic:param0=0.333:param1=0.333"
+                            elif "Lanczos" in algo:
+                                scale_filter_str = f"scale={target_w}:{target_h}:flags=lanczos"
+                            elif "Nearest" in algo:
+                                scale_filter_str = f"scale={target_w}:{target_h}:flags=neighbor"
+                            vf_chain.append(scale_filter_str)
+                            vf_chain.append(f"format={pix_fmt}")
+                            vf_chain.append("hwupload")
+                    else:
+                        # No scaling needed, just format and upload
+                        vf_chain.append(f"format={pix_fmt}")
+                        vf_chain.append("hwupload")
                 else:
-                    # Full VAAPI hardware path
-                    self.log_signal.emit(f"Pipeline: Full Hardware (VAAPI)")
-                    base_cmd.extend(["-hwaccel", "vaapi", "-hwaccel_device", device, "-hwaccel_output_format", "vaapi", "-i", input_file])
-                    vf_chain.append(f"scale_vaapi=w={target_w}:h={target_h}:format={pix_fmt}")
+                    # Universal VAAPI pipeline (Wiki Method #3)
+                    # Handles both HW-decodable and SW-decodable inputs automatically
+                    self.log_signal.emit("Pipeline: Universal VAAPI HW/SW Decode -> Encode")
+                    base_cmd.extend([
+                        "-init_hw_device", f"vaapi=va:{device}",
+                        "-hwaccel", "vaapi",
+                        "-hwaccel_output_format", "vaapi",
+                        "-hwaccel_device", "va",
+                        "-i", input_file,
+                        "-filter_hw_device", "va"
+                    ])
+                    
+                    # Conditional scaling (only when resolution changes)
+                    if target_w != orig_w or target_h != orig_h:
+                        vf_chain.append(f"scale_vaapi=w={target_w}:h={target_h}:format={pix_fmt}")
+                    
+                    # Universal format filter handles both HW and SW frames:
+                    # - If HW decode worked: frames in vaapi format, hwupload is no-op
+                    # - If HW decode failed: frames in SW format, format converts to nv12, hwupload uploads
+                    vf_chain.append(f"format={pix_fmt}|vaapi,hwupload")
 
         else:
             self.log_signal.emit("Pipeline: Full Software (CPU)")
             base_cmd.extend(["-i", input_file])
 
-            scale_filter_str = f"scale={target_w}:{target_h}:flags=bicubic"
-            if force_mitchell or "Mitchell" in algo:
-                 scale_filter_str = f"scale={target_w}:{target_h}:flags=bicubic:param0=0.333:param1=0.333"
-            elif "Lanczos" in algo:
-                 scale_filter_str = f"scale={target_w}:{target_h}:flags=lanczos"
-            elif "Nearest" in algo:
-                 scale_filter_str = f"scale={target_w}:{target_h}:flags=neighbor"
-
-            vf_chain.append(scale_filter_str)
+            # Conditional scaling (only when resolution changes)
+            if target_w != orig_w or target_h != orig_h:
+                scale_filter_str = f"scale={target_w}:{target_h}:flags=bicubic"
+                if force_mitchell or "Mitchell" in algo:
+                    scale_filter_str = f"scale={target_w}:{target_h}:flags=bicubic:param0=0.333:param1=0.333"
+                elif "Lanczos" in algo:
+                    scale_filter_str = f"scale={target_w}:{target_h}:flags=lanczos"
+                elif "Nearest" in algo:
+                    scale_filter_str = f"scale={target_w}:{target_h}:flags=neighbor"
+                vf_chain.append(scale_filter_str)
+            
+            # Format conversion for software encoder
             if is_av1:
-                 vf_chain.append("format=yuv420p10le")
+                vf_chain.append("format=yuv420p10le")
             else:
-                 vf_chain.append("format=yuv420p")
+                vf_chain.append("format=yuv420p")
 
         if vf_chain:
             base_cmd.extend(["-vf", ",".join(vf_chain)])
