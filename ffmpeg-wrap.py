@@ -1,3 +1,32 @@
+"""
+FFmpeg VAAPI Wrapper - Hardware-accelerated video transcoding GUI
+
+A PySide6-based GUI application for transcoding videos using FFmpeg with
+VAAPI hardware acceleration support for AMD/Intel GPUs on Linux.
+
+Features:
+- VAAPI hardware encoding (H.264, HEVC, AV1, VP9)
+- Vulkan hardware decoding for ProRes
+- Automatic GPU vendor detection (AMD/Intel)
+- Container/codec compatibility validation
+- Multi-file batch processing queue
+- Real-time progress and ETA tracking
+- 2-pass encoding for optimal quality at target sizes
+- Auto-downscale for low bitrate scenarios
+
+Requirements:
+- Python 3.6+
+- PySide6
+- FFmpeg with VAAPI support
+- FFprobe
+
+Usage:
+    python3 ffmpeg-wrap.py
+
+Author: lphin
+License: See LICENSE file
+"""
+
 import sys
 import os
 import subprocess
@@ -9,6 +38,8 @@ import threading
 import uuid
 import re
 import array
+from dataclasses import dataclass
+from typing import List, Optional, Tuple, Dict, Any
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                 QHBoxLayout, QLabel, QLineEdit, QPushButton,
                                 QComboBox, QTextEdit, QFormLayout, QMessageBox,
@@ -21,26 +52,290 @@ from concurrent.futures import ThreadPoolExecutor
 from PySide6.QtGui import QFont
 
 
+@dataclass
+class VideoInfo:
+    """Container for video file probe results"""
+    duration: float
+    width: int
+    height: int
+    codec: str
+    audio_count: int
+    audio_codec: str
+    decodable_audio_indices: List[int]
+    is_prores: bool
+    has_alpha: bool
+    
+    @property
+    def resolution(self) -> Tuple[int, int]:
+        return (self.width, self.height)
+    
+    @property
+    def is_valid(self) -> bool:
+        return self.width > 0 and self.height > 0
+
+
+def detect_gpu_vendor(device_path: str) -> str:
+    """Detect GPU vendor from DRI device path.
+    
+    Returns: 'amd', 'intel', or 'unknown'
+    """
+    try:
+        device_num = device_path.split('renderD')[-1]
+        vendor_path = f"/sys/class/drm/renderD{device_num}/device/vendor"
+        
+        if os.path.exists(vendor_path):
+            with open(vendor_path, 'r') as f:
+                vendor_id = f.read().strip()
+                if vendor_id.lower() == '0x8086':
+                    return 'intel'
+                elif vendor_id.lower() in ['0x1002', '0x1022']:
+                    return 'amd'
+        
+        card_path = f"/sys/class/drm/renderD{device_num}"
+        if os.path.exists(card_path):
+            device_link = os.path.realpath(f"{card_path}/device")
+            if 'i915' in device_link.lower():
+                return 'intel'
+            elif 'amdgpu' in device_link.lower() or 'radeon' in device_link.lower():
+                return 'amd'
+        
+        return 'unknown'
+    except Exception:
+        return 'unknown'
+
+
+# Container compatibility matrices for validation
+VIDEO_CODEC_CONTAINER_COMPAT = {
+    'MP4': {'h264', 'hevc', 'vp9', 'av1', 'mpeg4', 'prores'},
+    'WEBM': {'vp8', 'vp9', 'av1'},
+    'MKV': {'h264', 'hevc', 'vp8', 'vp9', 'av1', 'mpeg4', 'prores', 'mpeg2video'},
+    'MOV': {'prores', 'h264', 'hevc', 'dnxhd', 'mpeg4', 'jpeg'},
+}
+
+AUDIO_CODEC_CONTAINER_COMPAT = {
+    'MP4': {'aac', 'mp3', 'opus', 'alac', 'ac3', 'eac3', 'flac'},
+    'WEBM': {'opus', 'vorbis'},
+    'MKV': {'aac', 'mp3', 'opus', 'vorbis', 'flac', 'ac3', 'eac3', 'pcm_s16le'},
+    'MOV': {'pcm_s16le', 'pcm_s24le', 'pcm_s32le', 'pcm_f32le', 'aac', 'alac', 'mp3'},
+}
+
+
+class PipelineBuilder:
+    """Abstract base class for FFmpeg pipeline builders"""
+    
+    def build(self, params: Dict[str, Any], video_info: VideoInfo, target_w: int, target_h: int) -> Tuple[List[str], List[str], List[str]]:
+        """Build FFmpeg command components.
+        
+        Returns: (base_cmd: List[str], vf_chain: List[str], video_flags: List[str])
+        """
+        raise NotImplementedError
+    
+    def get_pipeline_name(self) -> str:
+        """Return human-readable pipeline name for logging"""
+        raise NotImplementedError
+
+
+class PassthroughPipelineBuilder(PipelineBuilder):
+    """Pipeline for direct stream copy"""
+    
+    def get_pipeline_name(self) -> str:
+        return "Video Passthrough (No re-encoding)"
+    
+    def build(self, params: Dict[str, Any], video_info: VideoInfo, target_w: int, target_h: int) -> Tuple[List[str], List[str], List[str]]:
+        base_cmd = ["ffmpeg", "-hide_banner", "-y", "-i", params['input']]
+        vf_chain = []
+        video_flags = ["-c:v", "copy"]
+        return base_cmd, vf_chain, video_flags
+
+
+class VulkanPipelineBuilder(PipelineBuilder):
+    """Pipeline for Vulkan hwaccel decode + VAAPI encode"""
+    
+    def __init__(self, device: str, pix_fmt: str):
+        self.device = device
+        self.pix_fmt = pix_fmt
+    
+    def get_pipeline_name(self) -> str:
+        return "ProRes Vulkan HW Decode -> VAAPI Encode"
+    
+    def build(self, params: Dict[str, Any], video_info: VideoInfo, target_w: int, target_h: int) -> Tuple[List[str], List[str], List[str]]:
+        base_cmd = [
+            "ffmpeg", "-hide_banner", "-y",
+            "-init_hw_device", "vulkan",
+            "-init_hw_device", f"vaapi=va:{self.device}",
+            "-filter_hw_device", "va",
+            "-hwaccel", "vulkan", "-i", params['input']
+        ]
+        
+        scale_filters = ["hwdownload"]
+        if target_w != video_info.width or target_h != video_info.height:
+            scale_filters.append(f"scale={target_w}:{target_h}:flags=bicubic")
+        scale_filters.append(f"format={self.pix_fmt}")
+        scale_filters.append("hwupload")
+        
+        vf_chain = [",".join(scale_filters)]
+        return base_cmd, vf_chain, []
+
+
+class VAAPIHwDecodePipelineBuilder(PipelineBuilder):
+    """Pipeline for VAAPI hardware decode + encode"""
+    
+    def __init__(self, device: str, pix_fmt: str):
+        self.device = device
+        self.pix_fmt = pix_fmt
+    
+    def get_pipeline_name(self) -> str:
+        return "Universal VAAPI HW/SW Decode -> Encode"
+    
+    def build(self, params: Dict[str, Any], video_info: VideoInfo, target_w: int, target_h: int) -> Tuple[List[str], List[str], List[str]]:
+        base_cmd = [
+            "ffmpeg", "-hide_banner", "-y",
+            "-init_hw_device", f"vaapi=va:{self.device}",
+            "-hwaccel", "vaapi",
+            "-hwaccel_output_format", "vaapi",
+            "-hwaccel_device", "va",
+            "-i", params['input'],
+            "-filter_hw_device", "va"
+        ]
+        
+        vf_chain = []
+        if target_w != video_info.width or target_h != video_info.height:
+            vf_chain.append(f"scale_vaapi=w={target_w}:h={target_h}:format={self.pix_fmt}")
+        
+        vf_chain.append(f"format={self.pix_fmt}|vaapi,hwupload")
+        
+        return base_cmd, vf_chain, []
+
+
+class CPUToVAPIPipelineBuilder(PipelineBuilder):
+    """Pipeline for CPU decode + VAAPI upload + encode"""
+    
+    def __init__(self, device: str, pix_fmt: str, algo: str, force_mitchell: bool = False):
+        self.device = device
+        self.pix_fmt = pix_fmt
+        self.algo = algo
+        self.force_mitchell = force_mitchell
+    
+    def get_pipeline_name(self) -> str:
+        return "CPU Decode -> VAAPI Upload -> Encode"
+    
+    def build(self, params: Dict[str, Any], video_info: VideoInfo, target_w: int, target_h: int) -> Tuple[List[str], List[str], List[str]]:
+        base_cmd = ["ffmpeg", "-hide_banner", "-y", "-vaapi_device", self.device, "-i", params['input']]
+        
+        vf_chain = []
+        if target_w != video_info.width or target_h != video_info.height:
+            if self.algo == "VAAPI (HW)":
+                # GPU scaling after upload
+                vf_chain.append(f"format={self.pix_fmt}")
+                vf_chain.append("hwupload")
+                vf_chain.append(f"scale_vaapi=w={target_w}:h={target_h}:format={self.pix_fmt}")
+            else:
+                # Software scaling before upload
+                scale_filter_str = f"scale={target_w}:{target_h}:flags=bicubic"
+                if self.force_mitchell:
+                    scale_filter_str = f"scale={target_w}:{target_h}:flags=bicubic:param0=0.333:param1=0.333"
+                elif "Lanczos" in self.algo:
+                    scale_filter_str = f"scale={target_w}:{target_h}:flags=lanczos"
+                elif "Nearest" in self.algo:
+                    scale_filter_str = f"scale={target_w}:{target_h}:flags=neighbor"
+                vf_chain.append(scale_filter_str)
+                vf_chain.append(f"format={self.pix_fmt}")
+                vf_chain.append("hwupload")
+        else:
+            vf_chain.append(f"format={self.pix_fmt}")
+            vf_chain.append("hwupload")
+        
+        return base_cmd, vf_chain, []
+
+
+class SoftwarePipelineBuilder(PipelineBuilder):
+    """Pipeline for software-only encoding"""
+    
+    def __init__(self, is_av1: bool, algo: str, force_mitchell: bool = False):
+        self.is_av1 = is_av1
+        self.algo = algo
+        self.force_mitchell = force_mitchell
+    
+    def get_pipeline_name(self) -> str:
+        return "Full Software (CPU)"
+    
+    def build(self, params: Dict[str, Any], video_info: VideoInfo, target_w: int, target_h: int) -> Tuple[List[str], List[str], List[str]]:
+        base_cmd = ["ffmpeg", "-hide_banner", "-y", "-i", params['input']]
+        
+        vf_chain = []
+        if target_w != video_info.width or target_h != video_info.height:
+            scale_filter_str = f"scale={target_w}:{target_h}:flags=bicubic"
+            if self.force_mitchell or "Mitchell" in self.algo:
+                scale_filter_str = f"scale={target_w}:{target_h}:flags=bicubic:param0=0.333:param1=0.333"
+            elif "Lanczos" in self.algo:
+                scale_filter_str = f"scale={target_w}:{target_h}:flags=lanczos"
+            elif "Nearest" in self.algo:
+                scale_filter_str = f"scale={target_w}:{target_h}:flags=neighbor"
+            vf_chain.append(scale_filter_str)
+        
+        # Format conversion for software encoder
+        if self.is_av1:
+            vf_chain.append("format=yuv420p10le")
+        else:
+            vf_chain.append("format=yuv420p")
+        
+        return base_cmd, vf_chain, []
+
+
 class ProbingCoordinator:
     """Coordinates log output from multiple prober threads for consistent ordering"""
     
     PROBER_ORDER = ['sw_encoders', 'audio_encoders', 'hw_encoders', 'hw_decoders', 'vulkan']
+    DEFAULT_TIMEOUT = 30.0
     
     def __init__(self):
         self.lock = threading.Lock()
         self.pending_probers = set()
         self.completed_logs = {}
         self.callback = None
+        self.timeout_callback = None
+        self.start_time = None
+        self.timeout = self.DEFAULT_TIMEOUT
     
-    def reset(self, prober_ids: list):
+    def reset(self, prober_ids: list, timeout: float = 30.0):
         with self.lock:
             self.pending_probers = set(prober_ids)
             self.completed_logs = {}
+            self.start_time = time.time()
+            self.timeout = timeout if timeout else self.DEFAULT_TIMEOUT
+    
+    def set_timeout_callback(self, callback):
+        self.timeout_callback = callback
+    
+    def check_timeout(self) -> bool:
+        if self.start_time is None:
+            return False
+        
+        elapsed = time.time() - self.start_time
+        if elapsed > self.timeout:
+            with self.lock:
+                if self.pending_probers:
+                    for prober_id in list(self.pending_probers):
+                        self.completed_logs[prober_id] = f"{prober_id}: TIMED OUT"
+                    self.pending_probers.clear()
+                    
+                    if self.callback:
+                        ordered_logs = []
+                        for prober_id in self.PROBER_ORDER:
+                            if prober_id in self.completed_logs:
+                                ordered_logs.append(self.completed_logs[prober_id])
+                        self.callback(ordered_logs)
+                    
+                    if self.timeout_callback:
+                        self.timeout_callback(elapsed)
+                    return True
+        return False
     
     def submit_logs(self, prober_id: str, logs: str, callback) -> bool:
         with self.lock:
             self.completed_logs[prober_id] = logs
             self.pending_probers.discard(prober_id)
+            self.callback = callback
             if len(self.pending_probers) == 0:
                 if callback:
                     ordered_logs = []
@@ -58,6 +353,7 @@ class EncoderWorker(QThread):
     finished_signal = Signal(bool)
     compatibility_warning_signal = Signal(str)
     progress_signal = Signal(int)  # Progress percentage (0-100)
+    eta_signal = Signal(int)  # Estimated seconds remaining
     
     # Pre-compiled regex pattern for efficient log line filtering
     LOG_KEYWORD_PATTERN = re.compile(r'frame=|Error|Stream #|kb/s|kB time=|error|Invalid argument', re.IGNORECASE)
@@ -73,7 +369,100 @@ class EncoderWorker(QThread):
         self.ffmpeg_path = params.get('ffmpeg_path', 'ffmpeg')
         self.ffprobe_path = params.get('ffprobe_path', 'ffprobe')
         self._process_lock = threading.Lock()
+        self._output_lock = threading.Lock()
         self.video_duration = 0.0  # Store video duration for progress calculation
+        self.output_file = None  # Track output file for cleanup
+        self.encode_start_time = None  # Track encode start time for ETA
+    
+    def validate_device_available(self, device_path: str) -> Tuple[bool, Optional[str]]:
+        """Validate hardware device is still available.
+        
+        Returns: (is_available: bool, error_message: Optional[str])
+        """
+        if not device_path:
+            return True, None  # Software mode, no device needed
+        
+        if not os.path.exists(device_path):
+            return False, f"Hardware device {device_path} not found"
+        
+        if not os.access(device_path, os.R_OK | os.W_OK):
+            return False, f"No read/write permission for device {device_path}"
+        
+        return True, None
+    
+    def set_output_file(self, filepath: str):
+        """Set the output file path for cleanup on cancellation"""
+        with self._output_lock:
+            self.output_file = filepath
+    
+    def check_disk_space(self, output_path: str, estimated_mb: float) -> Tuple[bool, float, float]:
+        """Check if there's enough disk space for encoding.
+        
+        Args:
+            output_path: Path to output file
+            estimated_mb: Estimated output size in MB
+        
+        Returns: (has_space: bool, available_mb: float, required_mb: float)
+        """
+        try:
+            output_dir = os.path.dirname(output_path)
+            if not output_dir:
+                output_dir = '.'
+            
+            if not os.path.exists(output_dir):
+                return True, 0, estimated_mb  # Directory doesn't exist yet, can't check
+            
+            stat = os.statvfs(output_dir)
+            available_mb = (stat.f_bavail * stat.f_frsize) / (1024 * 1024)
+            
+            # Add 10% safety margin
+            required_mb = estimated_mb * 1.1
+            
+            return (available_mb >= required_mb, available_mb, required_mb)
+        except OSError:
+            return True, 0, estimated_mb  # On error, allow encoding to proceed
+    
+    def estimate_output_size(self, params: Dict[str, Any], video_info: VideoInfo) -> float:
+        """Estimate output file size in MB.
+        
+        Returns: Estimated size in MB
+        """
+        mode = params.get('mode', 'quality')
+        
+        if mode == 'size':
+            # Target size mode - use specified size
+            try:
+                return float(params.get('size', 10))
+            except (ValueError, TypeError):
+                return 10.0
+        
+        # Quality mode - estimate based on bitrate
+        # Use a conservative estimate: CRF typically produces files
+        # that are 50-80% of the original for similar quality
+        try:
+            # Get input file size
+            input_size_mb = os.path.getsize(params['input']) / (1024 * 1024)
+            
+            # For CRF encoding, estimate based on resolution and CRF
+            crf = params.get('crf', 24)
+            # Lower CRF = larger file, higher CRF = smaller file
+            # CRF 23 is "neutral", adjust factor accordingly
+            crf_factor = 1.0 - ((crf - 23) * 0.05)  # 5% change per CRF step
+            crf_factor = max(0.3, min(2.0, crf_factor))  # Clamp between 0.3x and 2x
+            
+            estimated_mb = input_size_mb * crf_factor * 0.7  # Conservative estimate
+            return max(estimated_mb, 1.0)  # At least 1 MB
+        except (OSError, TypeError):
+            return 50.0  # Default estimate if input size unknown
+
+    def _clamp_bitrate(self, video_kbps: int) -> int:
+        """Clamp bitrate to valid range with warning for high values."""
+        if video_kbps < 1:
+            return 1
+        elif video_kbps > 100000:
+            self.log_signal.emit(f"Warning: Calculated bitrate {video_kbps}k is very high, capping at 100000k.")
+            return 100000
+        return video_kbps
 
     def cancel(self):
         self.is_cancelled = True
@@ -91,11 +480,91 @@ class EncoderWorker(QThread):
                         self.log_signal.emit(f"Warning: Process termination incomplete: {e}")
                 except (OSError, Exception) as e:
                     self.log_signal.emit(f"Warning: Error terminating process: {e}")
-            # Process is now None or terminated within the lock
-            self.process = None
+                self.process = None
+        
+        # Clean up partial output file
+        with self._output_lock:
+            if self.output_file and os.path.exists(self.output_file):
+                try:
+                    os.remove(self.output_file)
+                    self.log_signal.emit(f"Cleaned up partial file: {os.path.basename(self.output_file)}")
+                except (OSError, PermissionError) as e:
+                    self.log_signal.emit(f"Warning: Could not clean up partial file: {e}")
 
-    def get_video_info(self, filepath):
-        if self.is_cancelled: return None, 0, 0, "", 0, "", [], []
+    def _test_audio_decode_capability(self, codec_name: str) -> bool:
+        """Test if FFmpeg can decode a specific audio codec.
+        
+        Args:
+            codec_name: Audio codec name (e.g., 'aac', 'opus')
+        
+        Returns: True if codec is decodable
+        """
+        # Known decodable codecs (avoid probing for common ones)
+        common_decodable = {'aac', 'mp3', 'opus', 'vorbis', 'pcm_s16le', 'pcm_s24le', 
+                            'pcm_s32le', 'flac', 'alac', 'ac3', 'eac3'}
+        
+        if codec_name.lower() in common_decodable:
+            return True
+        
+        # Test decode capability for unknown codecs
+        cmd = [
+            self.ffmpeg_path, "-y", "-hide_banner",
+            "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
+            "-c:a", codec_name,
+            "-frames:a", "1",
+            "-f", "null", "-"
+        ]
+        
+        try:
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=3)
+            return result.returncode == 0
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            return False
+
+    def _select_pipeline_builder(self, params: Dict[str, Any], video_info: VideoInfo, is_av1: bool, force_mitchell: bool) -> PipelineBuilder:
+        """Select appropriate pipeline builder based on parameters"""
+        
+        video_codec_cmd = params.get('video_codec_cmd', 'libx264')
+        use_hw = params.get('use_hw', True)
+        
+        # Passthrough
+        if video_codec_cmd == "copy":
+            return PassthroughPipelineBuilder()
+        
+        pix_fmt = "yuv420p10le" if is_av1 else "nv12"
+        device = params.get('device', '/dev/dri/renderD128')
+        algo = params.get('algo', 'Bicubic')
+        
+        if use_hw:
+            use_vulkan_decode = (video_info.is_prores and 
+                                params.get('use_hw_decode', False) and 
+                                params.get('vulkan_available', False))
+            
+            if use_vulkan_decode:
+                return VulkanPipelineBuilder(device, pix_fmt)
+            
+            hw_decoder_caps = params.get('hw_decoder_caps', {})
+            input_codec = video_info.codec
+            can_hw_decode = hw_decoder_caps.get(input_codec, False)
+            
+            # Determine scaling approach
+            use_software_scaler = (
+                is_av1 or
+                algo != "VAAPI (HW)" or
+                force_mitchell
+            )
+            
+            if use_software_scaler or not can_hw_decode:
+                return CPUToVAPIPipelineBuilder(device, pix_fmt, algo, force_mitchell)
+            else:
+                return VAAPIHwDecodePipelineBuilder(device, pix_fmt)
+        
+        # Software pipeline
+        return SoftwarePipelineBuilder(is_av1, algo, force_mitchell)
+
+    def get_video_info(self, filepath: str) -> Optional[VideoInfo]:
+        if self.is_cancelled:
+            return None
 
         cmd = [
             self.ffprobe_path,
@@ -128,14 +597,18 @@ class EncoderWorker(QThread):
             for i, s in enumerate(audio_streams):
                 c_name = (s.get('codec_name') or '').strip().lower()
                 if c_name and c_name not in ('unknown', 'none'):
-                    decodable_audio_indices.append(i)
-                    if not audio_codec:
-                        audio_codec = s.get('codec_name', '') or ''
+                    # Test actual decode capability
+                    if self._test_audio_decode_capability(c_name):
+                        decodable_audio_indices.append(i)
+                        if not audio_codec:
+                            audio_codec = s.get('codec_name', '') or ''
+                    else:
+                        self.log_signal.emit(f"Notice: Audio stream {i} codec '{c_name}' not decodable, skipping")
 
             audio_count = len(decodable_audio_indices)
             if audio_count < len(audio_streams):
                 skipped = len(audio_streams) - audio_count
-                self.log_signal.emit(f"Notice: Skipping {skipped} audio stream(s) with unsupported codec.")
+                self.log_signal.emit(f"Notice: Skipping {skipped} audio stream(s) with unsupported/undecodable codec.")
 
             dur = None
             if 'format' in data and 'duration' in data['format']:
@@ -154,27 +627,37 @@ class EncoderWorker(QThread):
                 self.log_signal.emit("Warning: Duration metadata missing.")
                 dur = 0.0
 
-            # Detect ProRes variants and alpha channel
             is_prores = codec in ('prores', 'prores_aw', 'prores_ks')
             has_alpha = False
             if is_prores and codec == 'prores_ks':
-                # ProRes 4444/XQ may have alpha channel
                 pix_fmt = video_stream.get('pix_fmt', '')
                 if 'yuva' in pix_fmt or 'ya' in pix_fmt or '4444' in pix_fmt:
                     has_alpha = True
 
-            return dur, w, h, codec, audio_count, audio_codec, decodable_audio_indices, is_prores, has_alpha
+            return VideoInfo(
+                duration=dur,
+                width=w,
+                height=h,
+                codec=codec,
+                audio_count=audio_count,
+                audio_codec=audio_codec,
+                decodable_audio_indices=decodable_audio_indices,
+                is_prores=is_prores,
+                has_alpha=has_alpha
+            )
 
         except subprocess.CalledProcessError as e:
             self.log_signal.emit(f"FFprobe Error: {e.output.decode().strip()}")
-            return None, 0, 0, "", 0, "", [], False, False
+            return None
         except Exception as e:
             self.log_signal.emit(f"Probe Parse Exception: {str(e)}")
-            return None, 0, 0, "", 0, "", [], False, False
+            return None
 
     def run_ffmpeg_process(self, cmd, pass_name=""):
         if self.is_cancelled: return False
         if pass_name: self.log_signal.emit(f"--- STARTING {pass_name} ---")
+
+        self.encode_start_time = time.time()  # Track start time for ETA
 
         try:
             # Replace 'ffmpeg' with custom path if provided
@@ -228,6 +711,16 @@ class EncoderWorker(QThread):
                                 progress = int((current_time / self.video_duration) * 100)
                                 progress = max(0, min(100, progress))  # Clamp between 0-100
                                 self.progress_signal.emit(progress)
+                                
+                                # Calculate ETA
+                                if self.encode_start_time and current_time > 0:
+                                    elapsed = time.time() - self.encode_start_time
+                                    if elapsed > 0:
+                                        rate = current_time / elapsed  # seconds of video per second of encode
+                                        remaining_video = self.video_duration - current_time
+                                        if rate > 0:
+                                            eta_seconds = int(remaining_video / rate)
+                                            self.eta_signal.emit(eta_seconds)
                             except (ValueError, ZeroDivisionError):
                                 pass
 
@@ -290,15 +783,38 @@ class EncoderWorker(QThread):
         use_hw = p.get('use_hw', True)
         selected_codec = p['v_codec']
 
-        duration, orig_w, orig_h, input_codec, audio_count, audio_codec, decodable_audio_indices, is_prores, has_alpha = self.get_video_info(input_file)
-        self.video_duration = duration if duration else 0.0
+        video_info = self.get_video_info(input_file)
+        if video_info is None:
+            self.finished_signal.emit(False)
+            return
+        
+        self.video_duration = video_info.duration if video_info.duration else 0.0
 
-        if orig_w == 0 or orig_h == 0:
+        if video_info.width == 0 or video_info.height == 0:
             self.log_signal.emit("Error: Could not determine video resolution.")
             self.finished_signal.emit(False)
             return
 
-        self.log_signal.emit(f"=== Processing: {os.path.basename(input_file)} ({orig_w}x{orig_h} {input_codec}) ===")
+        self.log_signal.emit(f"=== Processing: {os.path.basename(input_file)} ({video_info.width}x{video_info.height} {video_info.codec}) ===")
+
+        orig_w = video_info.width
+        orig_h = video_info.height
+        input_codec = video_info.codec
+        
+        # Validate hardware device availability if using HW encoding
+        if use_hw:
+            device = p.get('device', '/dev/dri/renderD128')
+            available, error = self.validate_device_available(device)
+            if not available:
+                self.log_signal.emit(f"Error: {error}")
+                self.finished_signal.emit(False)
+                return
+        audio_count = video_info.audio_count
+        audio_codec = video_info.audio_codec
+        decodable_audio_indices = video_info.decodable_audio_indices
+        is_prores = video_info.is_prores
+        has_alpha = video_info.has_alpha
+        duration = video_info.duration
 
         # --- Video Passthrough Check ---
         if p['v_codec'] == "Passthrough":
@@ -504,12 +1020,7 @@ class EncoderWorker(QThread):
                     return
 
                 video_kbps = int((video_bits / duration) / 1000)
-                # Add bounds checking to prevent overflow
-                if video_kbps < 1:
-                    video_kbps = 1
-                elif video_kbps > 100000:  # Reasonable upper limit (100 Mbps)
-                    self.log_signal.emit(f"Warning: Calculated bitrate {video_kbps}k is very high, capping at 100000k.")
-                    video_kbps = 100000
+                video_kbps = self._clamp_bitrate(video_kbps)
 
                 # === SCALING & AUTO-SWITCH ===
                 if auto_scale and not is_av1:
@@ -537,12 +1048,7 @@ class EncoderWorker(QThread):
                     target_bits = effective_mb * 8 * 1024 * 1024
                     video_bits = target_bits - audio_total
                     video_kbps = int((video_bits / duration) / 1000)
-                    # Add bounds checking for forced AV1 case
-                    if video_kbps < 1:
-                        video_kbps = 1
-                    elif video_kbps > 100000:
-                        self.log_signal.emit(f"Warning: Calculated bitrate {video_kbps}k is very high, capping at 100000k.")
-                        video_kbps = 100000
+                    video_kbps = self._clamp_bitrate(video_kbps)
                     self.log_signal.emit("⚠ Auto-Scale: Forcing 2-pass encoding for optimal quality at low bitrate")
                 else:
                     self.log_signal.emit(f"Target: {target_mb}MB | Video: {video_kbps}k | Codec: {video_codec_cmd}")
@@ -608,6 +1114,23 @@ class EncoderWorker(QThread):
         pad_bottom = aligned_h - target_h
 
         output_file = f"{output_base}{v_tag}{ext}"
+        self.set_output_file(output_file)
+        
+        # Check disk space before encoding
+        estimated_size = self.estimate_output_size(p, video_info)
+        has_space, available, required = self.check_disk_space(output_file, estimated_size)
+        
+        if not has_space:
+            self.log_signal.emit(
+                f"Error: Insufficient disk space. "
+                f"Required: {required:.1f}MB, Available: {available:.1f}MB"
+            )
+            self.finished_signal.emit(False)
+            return
+        elif available < required * 1.5:
+            self.log_signal.emit(
+                f"Warning: Low disk space. Required: {required:.1f}MB, Available: {available:.1f}MB"
+            )
         
         # Validate output directory exists and is writable (only for non-custom output folders)
         output_dir = os.path.dirname(output_file)
@@ -746,14 +1269,14 @@ class EncoderWorker(QThread):
                         "-filter_hw_device", "va"
                     ])
                     
-                    # Conditional scaling (only when resolution changes)
+                    # Use scale_vaapi for both scaling and format conversion
+                    # This properly handles 10-bit to 8-bit conversion on GPU
                     if target_w != orig_w or target_h != orig_h:
                         vf_chain.append(f"scale_vaapi=w={target_w}:h={target_h}:format={pix_fmt}")
-                    
-                    # Universal format filter handles both HW and SW frames:
-                    # - If HW decode worked: frames in vaapi format, hwupload is no-op
-                    # - If HW decode failed: frames in SW format, format converts to nv12, hwupload uploads
-                    vf_chain.append(f"format={pix_fmt}|vaapi,hwupload")
+                    else:
+                        # No scaling needed, but still need format conversion for 10-bit content
+                        # scale_vaapi with output format ensures proper pixel format
+                        vf_chain.append(f"scale_vaapi=format={pix_fmt}")
 
         else:
             self.log_signal.emit("Pipeline: Full Software (CPU)")
@@ -920,19 +1443,35 @@ class EncoderWorker(QThread):
             success = self.run_ffmpeg_process(cmd_p2, "PASS 2")
 
             try:
-                # More specific pattern matching with validation
-                expected_files = [
-                    f"{pass_log_base}-0.log",
-                    f"{pass_log_base}-0.log.mbtree"
+                # Use glob to find all pass log files (handles variations)
+                log_pattern = f"{pass_log_base}*"
+                
+                for f in glob.glob(log_pattern):
+                    try:
+                        os.remove(f)
+                    except (OSError, PermissionError) as e:
+                        self.log_signal.emit(f"Warning: Could not remove {os.path.basename(f)}: {e}")
+                
+                # Also clean up any temporary files in the same directory
+                temp_dir = os.path.dirname(pass_log_base)
+                base_name = os.path.basename(pass_log_base)
+                
+                # FFmpeg sometimes creates files with different patterns
+                extra_patterns = [
+                    os.path.join(temp_dir, f"{base_name}*.log*"),
+                    os.path.join(temp_dir, f"{base_name}*.mbtree*"),
+                    os.path.join(temp_dir, f"ffmpeg2pass-{base_name}*")
                 ]
-                for f in expected_files:
-                    if os.path.exists(f):
+                
+                for pattern in extra_patterns:
+                    for f in glob.glob(pattern):
                         try:
                             os.remove(f)
-                        except (OSError, PermissionError) as e:
-                            self.log_signal.emit(f"Warning: Could not remove {f}: {e}")
-            except (OSError, PermissionError) as e:
-                self.log_signal.emit(f"Warning: Could not clean up pass log files: {e}")
+                        except (OSError, PermissionError):
+                            pass  # Silently ignore cleanup failures for extra patterns
+                                
+            except Exception as e:
+                self.log_signal.emit(f"Warning: Pass log cleanup error: {e}")
         else:
             cmd = base_cmd + map_flags + video_flags + audio_flags + meta_subs_flags + [output_file]
             success = self.run_ffmpeg_process(cmd, "ENCODE")
@@ -1115,34 +1654,8 @@ class HWDeviceProber(QThread):
         except Exception as e:
             return key, False, str(e)
     
-    def detect_gpu_vendor(self):
-        """Detect GPU vendor from DRI device path"""
-        try:
-            device_num = self.device_path.split('renderD')[-1]
-            vendor_path = f"/sys/class/drm/renderD{device_num}/device/vendor"
-            if os.path.exists(vendor_path):
-                with open(vendor_path, 'r') as f:
-                    vendor_id = f.read().strip()
-                    if vendor_id.lower() == '0x8086':
-                        return 'intel'
-                    elif vendor_id.lower() in ['0x1002', '0x1022']:
-                        return 'amd'
-            
-            card_path = f"/sys/class/drm/renderD{device_num}"
-            if os.path.exists(card_path):
-                device_link = os.path.realpath(f"{card_path}/device")
-                if 'i915' in device_link.lower():
-                    return 'intel'
-                elif 'amdgpu' in device_link.lower() or 'radeon' in device_link.lower():
-                    return 'amd'
-            
-            return 'unknown'
-        except Exception as e:
-            self.log_messages.append(f"Warning: Could not detect GPU vendor: {e}")
-            return 'unknown'
-    
     def run(self):
-        gpu_vendor = self.detect_gpu_vendor()
+        gpu_vendor = detect_gpu_vendor(self.device_path)
         self.log_messages.append(f"Hardware Device: {self.device_path} (GPU: {gpu_vendor.upper()})")
         
         codecs_to_check = [
@@ -1205,32 +1718,6 @@ class HWDecoderChecker(QThread):
         self.log_messages = []
         self.prober_id = 'hw_decoders'
     
-    def detect_gpu_vendor(self):
-        """Detect GPU vendor from DRI device path"""
-        try:
-            device_num = self.device_path.split('renderD')[-1]
-            vendor_path = f"/sys/class/drm/renderD{device_num}/device/vendor"
-            if os.path.exists(vendor_path):
-                with open(vendor_path, 'r') as f:
-                    vendor_id = f.read().strip()
-                    if vendor_id.lower() == '0x8086':
-                        return 'intel'
-                    elif vendor_id.lower() in ['0x1002', '0x1022']:
-                        return 'amd'
-            
-            card_path = f"/sys/class/drm/renderD{device_num}"
-            if os.path.exists(card_path):
-                device_link = os.path.realpath(f"{card_path}/device")
-                if 'i915' in device_link.lower():
-                    return 'intel'
-                elif 'amdgpu' in device_link.lower() or 'radeon' in device_link.lower():
-                    return 'amd'
-            
-            return 'unknown'
-        except Exception as e:
-            self.log_messages.append(f"Warning: Could not detect GPU vendor: {e}")
-            return 'unknown'
-    
     def _probe_decoder(self, dec_codec):
         cmd = [
             self.ffmpeg_path, "-y", "-hide_banner",
@@ -1251,8 +1738,7 @@ class HWDecoderChecker(QThread):
             return dec_codec, False, str(e)
     
     def run(self):
-        # Detect GPU vendor first
-        gpu_vendor = self.detect_gpu_vendor()
+        gpu_vendor = detect_gpu_vendor(self.device_path)
         self.decoder_caps['gpu_vendor'] = gpu_vendor
         self.log_messages.append(f"  Hardware Device: {self.device_path} (GPU: {gpu_vendor.upper()})")
         self.log_messages.append(f"  Hardware decoder support (VAAPI):")
@@ -1515,6 +2001,7 @@ class MainWindow(QMainWindow):
         self.available_audio_encoders = {'opus': False, 'aac': False}
         self.hw_decoder_capabilities = {}
         self.notification_manager = NotificationManager()
+        self._queue_paths_lock = threading.Lock()
         
         self.vulkan_available = False
         self.vulkan_capabilities = {}
@@ -1844,9 +2331,13 @@ class MainWindow(QMainWindow):
             }
         """)
         
-        self.time_label = QLabel("00:00:00")
+        self.time_label = QLabel("ETA: --:--:--")
         self.time_label.setStyleSheet("color: white; font-family: monospace; font-weight: bold;")
-        self.time_label.setMinimumWidth(70)
+        self.time_label.setMinimumWidth(90)
+        self.time_label.setCursor(Qt.PointingHandCursor)
+        self.time_label.setToolTip("Click to toggle ETA/Elapsed time")
+        self._show_eta = True  # Default to showing ETA
+        self.time_label.mousePressEvent = self._toggle_time_display
         
         progress_layout.addWidget(self.progress_bar)
         progress_layout.addWidget(self.time_label)
@@ -1881,6 +2372,11 @@ class MainWindow(QMainWindow):
 
         # Connect signals AFTER widgets are created
         self.device_combo.currentIndexChanged.connect(self.on_device_changed)
+        
+        # Connect validation signals for container/codec compatibility
+        self.container_combo.currentTextChanged.connect(self.validate_container_codec)
+        self.v_codec.currentTextChanged.connect(self.validate_container_codec)
+        self.a_codec.currentTextChanged.connect(self.validate_container_codec)
 
         # Initialize UI State with defaults
         self.update_codec_ui(self.v_codec.currentText())
@@ -1903,7 +2399,32 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(200, self.initial_probe)
         QTimer.singleShot(0, self.update_queue_placeholder)
         
+        self.probe_timeout_timer = None
+        self.probing_coordinator.set_timeout_callback(self._on_probe_timeout)
+        
         self.worker = None
+    
+    def _on_probe_timeout(self, elapsed: float):
+        """Handle probing timeout"""
+        self.log.append(f"Warning: Probing timed out after {elapsed:.1f}s. Some capabilities may be incomplete.")
+        if self.probe_timeout_timer:
+            self.probe_timeout_timer.stop()
+        self._check_probing_complete()
+    
+    def _start_probe_timeout_timer(self):
+        """Start timeout timer for probing"""
+        if self.probe_timeout_timer:
+            self.probe_timeout_timer.stop()
+        self.probe_timeout_timer = QTimer()
+        self.probe_timeout_timer.timeout.connect(self._check_probe_timeout)
+        self.probe_timeout_timer.start(1000)  # Check every second
+    
+    def _check_probe_timeout(self):
+        """Check if probing has timed out"""
+        if self.probing_coordinator.check_timeout():
+            if self.probe_timeout_timer:
+                self.probe_timeout_timer.stop()
+            self._check_probing_complete()
 
     # --- CHECKBOX HANDLERS ---
     def on_hw_toggled(self, checked):
@@ -1991,6 +2512,50 @@ class MainWindow(QMainWindow):
             self.algo_combo.setEnabled(False)
             self.chk_auto_scale.setEnabled(False)
             self.mode_stack.setEnabled(False)
+
+    def validate_container_codec(self):
+        """Validate container and codec compatibility in real-time"""
+        if self.mode_combo.currentText() == "Passthrough":
+            # Passthrough validation handled separately
+            return
+        
+        container = self.container_combo.currentText()
+        if container == "Auto":
+            return  # Auto will pick compatible container
+        
+        v_codec = self.v_codec.currentText().lower().replace('.', '')
+        if v_codec == 'h264':
+            v_codec_key = 'h264'
+        elif v_codec == 'h265':
+            v_codec_key = 'hevc'
+        elif v_codec == 'av1':
+            v_codec_key = 'av1'
+        elif v_codec == 'vp9':
+            v_codec_key = 'vp9'
+        else:
+            v_codec_key = v_codec
+        
+        compatible_codecs = VIDEO_CODEC_CONTAINER_COMPAT.get(container, set())
+        
+        if v_codec_key not in compatible_codecs:
+            # Show inline warning in log
+            self.log.append(f"Note: {v_codec.upper()} may not be optimal for {container}")
+            # Set tooltip on container combo
+            self.container_combo.setToolTip(
+                f"Note: {v_codec.upper()} is not optimal for {container}\n"
+                f"Compatible codecs: {', '.join(sorted(compatible_codecs))}"
+            )
+        else:
+            self.container_combo.setToolTip("")
+        
+        # Validate audio codec too
+        a_codec = self.a_codec.currentText()
+        if a_codec not in ["Passthrough", "PCM"]:
+            a_codec_key = a_codec.lower()
+            a_compatible = AUDIO_CODEC_CONTAINER_COMPAT.get(container, set())
+            
+            if a_codec_key not in a_compatible:
+                self.log.append(f"Note: {a_codec} audio will be converted for {container}")
 
     # --- SOFTWARE ENCODER DETECTION ---
     
@@ -2120,6 +2685,8 @@ class MainWindow(QMainWindow):
         
         if sw_done and audio_done and hw_enc_done and hw_dec_done and vulkan_done:
             self._probing_active = False
+            if self.probe_timeout_timer:
+                self.probe_timeout_timer.stop()
             self._set_ui_enabled(True)
             if not self._initial_probing_done:
                 self._initial_probing_done = True
@@ -2159,6 +2726,7 @@ class MainWindow(QMainWindow):
         ffmpeg_cmd = ffmpeg_path if ffmpeg_path else 'ffmpeg'
         
         self.probing_coordinator.reset(['sw_encoders'])
+        self._start_probe_timeout_timer()
         
         self.sw_encoder_checker = SWEncoderChecker(ffmpeg_cmd)
         self.sw_encoder_checker.log_signal.connect(lambda msg: self._on_prober_log('sw_encoders', msg))
@@ -2511,7 +3079,7 @@ class MainWindow(QMainWindow):
                     self.fps_custom_input.setText("30")
 
     def show_scale_notification(self, res_text):
-        if not self.chk_silent.isChecked():
+        if not self.chk_no_sound.isChecked():
             QMessageBox.information(self, "Auto-Scale", f"Bitrate too low.\nResolution set to {res_text}.")
     
     def show_compatibility_warning(self, message):
@@ -2611,9 +3179,10 @@ class MainWindow(QMainWindow):
             for f in files: self.add_path_to_queue(f)
 
     def add_path_to_queue(self, fpath):
-        if fpath in self._queue_paths: return
+        with self._queue_paths_lock:
+            if fpath in self._queue_paths:
+                return
         
-        # Validate file exists and is accessible before adding to queue
         if not os.path.exists(fpath):
             self.log.append(f"Error: File does not exist: {os.path.basename(fpath)}")
             return
@@ -2629,20 +3198,23 @@ class MainWindow(QMainWindow):
         item = QListWidgetItem(os.path.basename(fpath))
         item.setData(Qt.UserRole, fpath)
         self.queue_list.addItem(item)
-        self._queue_paths.add(fpath)
+        with self._queue_paths_lock:
+            self._queue_paths.add(fpath)
         self.log.append(f"Added: {os.path.basename(fpath)}")
         self.update_queue_placeholder()
 
     def remove_from_queue(self):
-        for item in self.queue_list.selectedItems():
-            fpath = item.data(Qt.UserRole)
-            self.queue_list.takeItem(self.queue_list.row(item))
-            self._queue_paths.discard(fpath)
+        with self._queue_paths_lock:
+            for item in self.queue_list.selectedItems():
+                fpath = item.data(Qt.UserRole)
+                self.queue_list.takeItem(self.queue_list.row(item))
+                self._queue_paths.discard(fpath)
         self.update_queue_placeholder()
 
     def clear_queue(self):
-        self.queue_list.clear()
-        self._queue_paths.clear()
+        with self._queue_paths_lock:
+            self.queue_list.clear()
+            self._queue_paths.clear()
         self.update_queue_placeholder()
 
     def update_queue_placeholder(self):
@@ -2781,7 +3353,7 @@ class MainWindow(QMainWindow):
         
         # Start timer for this job
         self.job_start_time = time.time()
-        self.time_label.setText("00:00:00")
+        self.time_label.setText("ETA: --:--:--")
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_elapsed_time)
         self.timer.start(1000)  # Update every second
@@ -2792,16 +3364,42 @@ class MainWindow(QMainWindow):
         self.worker.finished_signal.connect(self.job_finished)
         self.worker.compatibility_warning_signal.connect(self.show_compatibility_warning)
         self.worker.progress_signal.connect(self.update_progress)
+        self.worker.eta_signal.connect(self.update_eta)
         self.worker.start()
     
     def update_elapsed_time(self):
         """Update the elapsed time display"""
-        if hasattr(self, 'job_start_time'):
+        if not self._show_eta and hasattr(self, 'job_start_time'):
             elapsed = time.time() - self.job_start_time
             hours = int(elapsed // 3600)
             minutes = int((elapsed % 3600) // 60)
             seconds = int(elapsed % 60)
-            self.time_label.setText(f"{hours:02d}:{minutes:02d}:{seconds:02d}")
+            self.time_label.setText(f"Elapsed: {hours:02d}:{minutes:02d}:{seconds:02d}")
+
+    def update_eta(self, eta_seconds: int):
+        """Update the ETA display"""
+        if self._show_eta:
+            if eta_seconds >= 0:
+                hours = eta_seconds // 3600
+                minutes = (eta_seconds % 3600) // 60
+                seconds = eta_seconds % 60
+                self.time_label.setText(f"ETA: {hours:02d}:{minutes:02d}:{seconds:02d}")
+            else:
+                self.time_label.setText("ETA: --:--:--")
+
+    def _toggle_time_display(self, event):
+        """Toggle between ETA and Elapsed time display"""
+        self._show_eta = not self._show_eta
+        # Immediately update the display
+        if hasattr(self, 'job_start_time'):
+            if self._show_eta:
+                self.time_label.setText("ETA: --:--:--")
+            else:
+                elapsed = time.time() - self.job_start_time
+                hours = int(elapsed // 3600)
+                minutes = int((elapsed % 3600) // 60)
+                seconds = int(elapsed % 60)
+                self.time_label.setText(f"Elapsed: {hours:02d}:{minutes:02d}:{seconds:02d}")
 
     def job_finished(self, success):
         if success: self.log.append(">>> JOB FINISHED SUCCESSFULLY")
