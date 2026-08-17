@@ -34,3 +34,18 @@ Fedora users can find software encoders (libx264, libx265) and hardware encoders
 ## Running the Script
 ```bash
 python3 ffmpeg-wrap.py
+```
+
+## Tests
+
+The test suite is split into fast unit tests (no ffmpeg needed) and integration
+tests that run real ffmpeg encodes (skipped automatically when ffmpeg or a
+VAAPI render device is missing).
+
+```bash
+pip install --user pytest
+python3 -m pytest                    # all tests (integration included)
+python3 -m pytest -m "not ffmpeg"    # unit/GUI tests only, no ffmpeg encodes
+```
+
+GUI tests run headless via `QT_QPA_PLATFORM=offscreen` (set in `tests/conftest.py`).
