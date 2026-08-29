@@ -77,6 +77,7 @@ def params():
         "vulkan_available": False,
         "quality_preset": 2,
         "two_pass": False,
+        "hw_decode_2pass": False,
         "res_choice": "Original",
         "ar_choice": "Original",
         "fps_choice": "Original",

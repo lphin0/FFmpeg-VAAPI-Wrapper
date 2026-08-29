@@ -40,13 +40,15 @@ import threading
 import uuid
 import re
 import array
-from dataclasses import dataclass
+import shutil
+import signal
+from dataclasses import dataclass, field
 from typing import List, Optional, Tuple, Dict, Any
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                 QHBoxLayout, QLabel, QLineEdit, QPushButton,
                                 QComboBox, QTextEdit, QFormLayout, QMessageBox,
                                 QFileDialog, QCheckBox, QGroupBox, QListWidget,
-                                QListWidgetItem, QSlider, QSpinBox, QStackedWidget,
+                                QListWidgetItem, QSpinBox, QStackedWidget,
                                 QAbstractItemView, QSizePolicy, QProgressBar)
 from PySide6.QtCore import Qt, QThread, Signal, QTimer
 import time
@@ -68,6 +70,9 @@ class VideoInfo:
     is_prores: bool
     has_alpha: bool
     fps: float = 0.0
+    # Per-audio-stream bitrate in kbps (0.0 when unknown); index-matched to
+    # audio_codecs. Used to budget for passthrough audio in size mode.
+    audio_bitrates: List[float] = field(default_factory=list)
     
     @property
     def resolution(self) -> Tuple[int, int]:
@@ -129,6 +134,12 @@ def codec_key_from_ui(codec_text: str) -> str:
     if key in ('h264', 'h265', 'av1', 'vp9'):
         return 'hevc' if key == 'h265' else key
     return key
+
+
+# Ceiling for a single ffprobe run. Without it a malformed/stalled file can
+# block the worker thread forever, and cancel() cannot interrupt a blocking
+# subprocess call.
+FFPROBE_TIMEOUT = 60
 
 
 def validate_input_file(filepath: str) -> Optional[str]:
@@ -246,6 +257,25 @@ def parse_frame_rate(rate_str: str) -> float:
     return 0.0
 
 
+def stream_bitrate_kbps(stream: Dict[str, Any]) -> float:
+    """Best-effort audio stream bitrate (kbps) from ffprobe stream fields.
+
+    Some containers omit bit_rate; fall back to estimating from the stream's
+    size and duration. Returns 0.0 when the bitrate cannot be determined.
+    """
+    try:
+        br = float(stream.get('bit_rate') or 0)
+        if br > 0:
+            return br / 1000.0
+        size = float(stream.get('size') or 0)
+        dur = float(stream.get('duration') or 0)
+        if size > 0 and dur > 0:
+            return (size * 8 / dur) / 1000.0
+    except (ValueError, TypeError):
+        pass
+    return 0.0
+
+
 def svt_gop_size(fps: Optional[float] = None) -> int:
     """GOP length (frames) for SVT-AV1 size-mode rate control.
 
@@ -255,6 +285,23 @@ def svt_gop_size(fps: Optional[float] = None) -> int:
     if fps and fps > 0:
         return max(120, int(round(fps * 5)))
     return 300
+
+
+def should_run_2pass(mode: str, use_hw: bool, video_codec_cmd: str,
+                     is_short_video: bool, two_pass_requested: bool,
+                     forced_av1: bool) -> bool:
+    """Decide whether a size-mode encode runs as two passes.
+
+    2-pass only applies to software size-mode encodes of real video. Short
+    clips (<30s) normally use single-pass VBR with a tight maxrate, which
+    tracks the target better than 2-pass does at that length - but an
+    auto-scale "forced AV1" switch always wants 2-pass, even for short clips.
+    """
+    if mode != 'size' or use_hw or video_codec_cmd == "copy":
+        return False
+    if not (two_pass_requested or forced_av1):
+        return False
+    return forced_av1 or not is_short_video
 
 
 def calc_size_mode_bitrate(target_mb: float, duration: float, audio_bitrate: float,
@@ -272,6 +319,36 @@ def calc_size_mode_bitrate(target_mb: float, duration: float, audio_bitrate: flo
     audio_total = audio_bitrate * 1000 * duration * num_audio_streams
     video_bits = target_bits - audio_total
     return max(1, int((video_bits / duration) / 1000))
+
+
+# Stand-in bitrate for passthrough audio whose source bitrate is unknown.
+# MKV and several other containers publish no per-stream bit_rate at all, so
+# without a floor those streams are budgeted as free and the target is overshot.
+PASSTHROUGH_AUDIO_FALLBACK_KBPS = 192.0
+
+
+def passthrough_audio_budget(audio_bitrates: List[float],
+                             stream_indices: List[int]) -> Tuple[int, float]:
+    """Bitrate budget (stream count, average kbps) for passthrough audio.
+
+    Streams with a measured bitrate reserve that bitrate; streams with an
+    unknown bitrate reserve PASSTHROUGH_AUDIO_FALLBACK_KBPS so the size target
+    is not exceeded. Returns (num_streams, average_kbps); calc_size_mode_bitrate
+    multiplies the two back into the total reserve.
+    """
+    known = []
+    unknown = 0
+    for i in stream_indices:
+        br = audio_bitrates[i] if i < len(audio_bitrates) else 0.0
+        if br > 0:
+            known.append(br)
+        else:
+            unknown += 1
+    count = len(known) + unknown
+    if count == 0:
+        return 0, 0.0
+    total = sum(known) + unknown * PASSTHROUGH_AUDIO_FALLBACK_KBPS
+    return count, total / count
 
 
 def build_video_flags(*, video_codec_cmd: str, use_hw: bool, is_av1: bool, is_vp9: bool,
@@ -364,8 +441,11 @@ def build_video_flags(*, video_codec_cmd: str, use_hw: bool, is_av1: bool, is_vp
                 video_flags.extend(["-preset", presets[p_idx]])
 
         if "hevc" in video_codec_cmd or "x265" in video_codec_cmd:
-            if pad_right > 0 or pad_bottom > 0:
-                emit(f"Metadata: Cropping padding (Right:{pad_right}, Bottom:{pad_bottom}) for HEVC.")
+            # Software HEVC encoders output the exact requested resolution, so
+            # an alignment crop would cut real content; the crop is only
+            # correct for VAAPI, whose surfaces are padded to alignment.
+            if use_hw and (pad_right > 0 or pad_bottom > 0):
+                emit(f"Metadata: Cropping VAAPI alignment padding (Right:{pad_right}, Bottom:{pad_bottom}) for HEVC.")
                 video_flags.extend(["-bsf:v", f"hevc_metadata=crop_right={pad_right}:crop_bottom={pad_bottom}"])
         elif use_hw and (pad_right > 0 or pad_bottom > 0):
             emit(f"Warning: Resolution {pad_right}px padding detected for HW encode; encoder may add internal padding.")
@@ -433,12 +513,16 @@ def build_vf_chain(*, input_file: str, device: str, video_codec_cmd: str, use_hw
 
     if not use_hw:
         extras = ["-i", input_file]
+        if fps_filter:
+            vf_chain.append(fps_filter)
         if target_w != orig_w or target_h != orig_h:
             vf_chain.append(build_scale_filter(target_w, target_h, algo, force_mitchell or "Mitchell" in algo))
         vf_chain.append("format=yuv420p10le" if is_av1 else "format=yuv420p")
         return extras, vf_chain, "Full Software (CPU)"
 
-    if use_vulkan_decode and not force_cpu_path:
+    # The Vulkan pipeline has no slot for the software fps filter, so a
+    # framerate change falls through to the CPU-decode path below.
+    if use_vulkan_decode and not force_cpu_path and not fps_filter:
         extras = [
             "-init_hw_device", "vulkan",
             "-init_hw_device", f"vaapi=va:{device}",
@@ -521,16 +605,84 @@ def build_vf_chain(*, input_file: str, device: str, video_codec_cmd: str, use_hw
     return extras, vf_chain, "Universal VAAPI HW/SW Decode -> Encode"
 
 
+def apply_vaapi_hwdecode(cmd, *, enabled=False, can_hw_decode=False, device="",
+                         is_av1=False, fps_filter="",
+                         target_w=0, target_h=0, orig_w=0, orig_h=0):
+    """Rewrite cmd for VAAPI hardware decoding with GPU-side scaling.
+
+    Frames stay in GPU memory after decode (-hwaccel_output_format vaapi),
+    scale_vaapi performs the resize (or just the format conversion when the
+    resolution is unchanged) on the GPU, and one hwdownload moves the result
+    to system RAM for the software encoder. Downloading after an eventual
+    downscale also minimizes PCIe traffic. This trades wall-clock speed for
+    much lower CPU usage (opt-in via "HW-Decode Passes").
+
+    The software fps filter cannot consume VAAPI frames, so fps_filter (when
+    present) is re-inserted after the download. The chain is built from the
+    explicit parameters rather than reusing the caller's filter chain, so
+    unrelated software filters (e.g. a trailing hwupload from another
+    pipeline) can never leak into the rewritten command.
+
+    Mutates cmd in place (input flags and -vf). Returns True if applied.
+    """
+    if not (enabled and can_hw_decode and device):
+        return False
+    try:
+        v = cmd.index("-vf")
+        i = cmd.index("-i")
+    except ValueError:
+        # Without -vf there is nowhere to download frames (keeping them in
+        # GPU memory would break the software encoder); without -i the
+        # decode flags have nowhere to go.
+        return False
+    fmt = "p010le" if is_av1 else "nv12"
+    sw_fmt = "yuv420p10le" if is_av1 else "yuv420p"
+    if target_w and target_h and (target_w != orig_w or target_h != orig_h):
+        head = f"scale_vaapi=w={target_w}:h={target_h}:format={fmt}"
+    else:
+        head = f"scale_vaapi=format={fmt}"
+    chain = [head, "hwdownload", f"format={fmt}"]
+    if fps_filter:
+        chain.append(fps_filter)
+    if sw_fmt != fmt:
+        chain.append(f"format={sw_fmt}")
+    cmd[v + 1] = ",".join(chain)
+    cmd[i:i] = ["-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi",
+                "-hwaccel_device", _existing_vaapi_device_name(cmd, device)]
+    return True
+
+
+def _existing_vaapi_device_name(cmd: List[str], device: str) -> str:
+    """Reuse a VAAPI device the command already declares, if it matches.
+
+    `-init_hw_device vaapi=va:/dev/dri/renderD128` names the device "va";
+    pointing -hwaccel_device at that name reuses the open instance. Passing the
+    raw path instead would make FFmpeg open the DRM node a second time, which
+    wastes resources and is rejected by some drivers.
+    """
+    for flag, value in zip(cmd, cmd[1:]):
+        if flag == "-init_hw_device" and value.startswith("vaapi="):
+            name, _, path = value.partition("=")[2].partition(":")
+            if path == device:
+                return name
+    return device
+
+
 class EncoderOutputReader:
     """Reads an ffmpeg output stream without ever stopping.
 
     The previous implementation stopped reading after N matched log lines,
     which let the pipe fill up and block ffmpeg indefinitely. This reader
     keeps draining the stream and only throttles what it forwards to the UI.
+
+    Progress lines ("frame= ...") repeat many times per second and differ only
+    in the counters, so they are forwarded only when the completion percentage
+    advances. Errors and the start/end summary lines always come through.
     """
 
     TIME_PATTERN = re.compile(r'time=(\d{2}):(\d{2}):(\d{2}\.\d+)')
     KEYWORD_PATTERN = re.compile(r'frame=|Error|Stream #|kb/s|kB time=|error|Invalid argument', re.IGNORECASE)
+    ALWAYS_LOG_PATTERN = re.compile(r'Error|Stream #|kb/s|kB time=|error|Invalid argument', re.IGNORECASE)
     MAX_EMIT = 10000
     SUPPRESSION_NOTICE_EVERY = 1000
 
@@ -543,38 +695,62 @@ class EncoderOutputReader:
         self.progress_cb = progress_cb
         self.eta_cb = eta_cb
         self.is_cancelled = is_cancelled
+        self.lines_seen = 0  # Total lines drained (regression-test hook)
 
     def read_loop(self) -> int:
         """Read until EOF or cancellation. Returns the number of suppressed lines."""
         emitted = 0
         suppressed = 0
+        last_percent = -1
         while True:
             if self.is_cancelled():
                 break
             line = self.stream.readline()
             if not line:
                 break  # EOF
+            self.lines_seen += 1
             line = line.strip()
-            if line:
-                self._parse_progress(line)
-                if self.KEYWORD_PATTERN.search(line):
-                    if emitted < self.MAX_EMIT:
-                        self.log_cb(line)
-                        emitted += 1
-                    else:
-                        suppressed += 1
-                        if suppressed % self.SUPPRESSION_NOTICE_EVERY == 0:
-                            self.log_cb(f"(suppressing further log output, {suppressed} lines dropped)")
+            if not line:
+                continue
+            percent = self._parse_progress(line)
+            if self._should_log(line, percent, last_percent, emitted):
+                if emitted < self.MAX_EMIT:
+                    self.log_cb(line)
+                    emitted += 1
+                else:
+                    suppressed += 1
+                    if suppressed % self.SUPPRESSION_NOTICE_EVERY == 0:
+                        self.log_cb(f"(suppressing further log output, {suppressed} lines dropped)")
+            elif self.KEYWORD_PATTERN.search(line):
+                # Redundant progress line: still counted, so the emit cap
+                # bounds total output even on pathological encodes.
+                suppressed += 1
+            if percent is not None:
+                last_percent = percent
         if suppressed:
             self.log_cb(f"Log output suppressed for {suppressed} lines (UI limit reached).")
         return suppressed
 
-    def _parse_progress(self, line: str):
+    def _should_log(self, line: str, percent: Optional[int],
+                    last_percent: int, emitted: int) -> bool:
+        """Decide whether a line is worth sending to the UI."""
+        if self.ALWAYS_LOG_PATTERN.search(line):
+            return True
+        if self.KEYWORD_PATTERN.search(line):
+            # Bare progress line: show the first one (start of encode) and
+            # then only when the completion percentage advances.
+            if percent is not None and percent != last_percent:
+                return True
+            return emitted == 0
+        return False
+
+    def _parse_progress(self, line: str) -> Optional[int]:
+        """Update progress/ETA from a line; returns the new percent, if any."""
         if self.video_duration <= 0:
-            return
+            return None
         match = self.TIME_PATTERN.search(line)
         if not match:
-            return
+            return None
         try:
             hours = int(match.group(1))
             minutes = int(match.group(2))
@@ -590,8 +766,9 @@ class EncoderOutputReader:
                     if rate > 0:
                         eta_seconds = int((self.video_duration - current_time) / rate)
                         self.eta_cb(eta_seconds)
+            return max(0, min(100, progress))
         except (ValueError, ZeroDivisionError):
-            pass
+            return None
 
 
 class ProbingCoordinator:
@@ -721,7 +898,10 @@ class EncoderWorker(QThread):
                 output_dir = '.'
             
             if not os.path.exists(output_dir):
-                return True, 0, estimated_mb  # Directory doesn't exist yet, can't check
+                # Directory doesn't exist yet (the worker creates it later), so
+                # there is nothing to measure. Report "unlimited" rather than 0,
+                # which the caller would misread as "out of disk".
+                return True, math.inf, estimated_mb
             
             stat = os.statvfs(output_dir)
             available_mb = (stat.f_bavail * stat.f_frsize) / (1024 * 1024)
@@ -787,9 +967,9 @@ class EncoderWorker(QThread):
                     try:
                         self.process.kill()
                         self.process.wait(timeout=5)
-                    except (subprocess.TimeoutExpired, OSError, Exception) as e:
+                    except Exception as e:
                         self.log_signal.emit(f"Warning: Process termination incomplete: {e}")
-                except (OSError, Exception) as e:
+                except Exception as e:
                     self.log_signal.emit(f"Warning: Error terminating process: {e}")
                 self.process = None
         
@@ -801,6 +981,10 @@ class EncoderWorker(QThread):
                     self.log_signal.emit(f"Cleaned up partial file: {os.path.basename(self.output_file)}")
                 except (OSError, PermissionError) as e:
                     self.log_signal.emit(f"Warning: Could not clean up partial file: {e}")
+
+    def was_cancelled(self) -> bool:
+        """Public accessor for the cancelled flag (safe to call from the GUI)."""
+        return self.is_cancelled
 
     def get_video_info(self, filepath: str) -> Optional[VideoInfo]:
         if self.is_cancelled:
@@ -816,7 +1000,8 @@ class EncoderWorker(QThread):
         ]
 
         try:
-            output = subprocess.check_output(cmd, stderr=subprocess.STDOUT).decode().strip()
+            output = subprocess.check_output(cmd, stderr=subprocess.STDOUT,
+                                             timeout=FFPROBE_TIMEOUT).decode().strip()
             data = json.loads(output)
 
             if not data.get('streams'):
@@ -836,10 +1021,12 @@ class EncoderWorker(QThread):
             decodable_audio_indices = []
             audio_codec = ""
             audio_codecs = []
+            audio_bitrates = []
 
             for i, s in enumerate(audio_streams):
                 c_name = (s.get('codec_name') or '').strip().lower()
                 audio_codecs.append(c_name if c_name else 'unknown')
+                audio_bitrates.append(stream_bitrate_kbps(s))
                 if c_name and c_name not in ('unknown', 'none'):
                     decodable_audio_indices.append(i)
                     if not audio_codec:
@@ -883,8 +1070,14 @@ class EncoderWorker(QThread):
                 is_prores=is_prores,
                 has_alpha=has_alpha,
                 fps=fps,
+                audio_bitrates=audio_bitrates,
             )
 
+        except subprocess.TimeoutExpired:
+            self.log_signal.emit(
+                f"Error: ffprobe timed out after {FFPROBE_TIMEOUT:.0f}s "
+                f"on {os.path.basename(filepath)}. File may be malformed.")
+            return None
         except subprocess.CalledProcessError as e:
             self.log_signal.emit(f"FFprobe Error: {e.output.decode().strip()}")
             return None
@@ -930,31 +1123,22 @@ class EncoderWorker(QThread):
                 except OSError:
                     pass
 
-            process.wait(timeout=3600)  # 1 hour timeout
+            # Wait indefinitely: cancel() is the escape hatch, and a hard cap
+            # here would kill legitimate long encodes (e.g. multi-hour movies).
+            # The output reader above always drains the pipe to EOF, so this
+            # returns as soon as ffmpeg exits.
+            process.wait()
             returncode = process.returncode
             with self._process_lock:
                 self.process = None
             return returncode == 0 and not self.is_cancelled
-        except subprocess.TimeoutExpired as e:
-            if not self.is_cancelled:
-                self.log_signal.emit(f"Process timeout after 1 hour: {e}")
-            # Never leave an orphaned ffmpeg running
-            if process is not None:
-                try:
-                    process.kill()
-                    process.wait(timeout=5)
-                except (subprocess.TimeoutExpired, OSError, Exception):
-                    pass
-            with self._process_lock:
-                self.process = None
-            return False
         except Exception as e:
             if not self.is_cancelled:
                 self.log_signal.emit(f"Process Error: {e}")
             if process is not None and process.poll() is None:
                 try:
                     process.kill()
-                except (OSError, Exception):
+                except Exception:
                     pass
             with self._process_lock:
                 self.process = None
@@ -1013,6 +1197,7 @@ class EncoderWorker(QThread):
                 return
         audio_count = video_info.audio_count
         audio_codecs = video_info.audio_codecs
+        audio_bitrates = video_info.audio_bitrates
         decodable_audio_indices = video_info.decodable_audio_indices
         is_prores = video_info.is_prores
         duration = video_info.duration
@@ -1126,7 +1311,19 @@ class EncoderWorker(QThread):
                 else:
                     enc = "aac"  # Native aac
                     self.log_signal.emit("Audio Encoder: Using native aac")
-            
+
+            # Block codec/container pairs the muxer cannot write (MKV/Auto
+            # impose no restrictions, mirroring the video codec check).
+            audio_compat = AUDIO_CODEC_CONTAINER_COMPAT.get(container_mode)
+            enc_key = 'opus' if a_codec == 'Opus' else 'aac'
+            if decodable_audio_indices and audio_compat is not None and enc_key not in audio_compat:
+                self.compatibility_warning_signal.emit(
+                    f"{a_codec} audio is not supported in the {container_mode} container. "
+                    f"Please select a different container or audio codec."
+                )
+                self.finished_signal.emit(False)
+                return
+
             try:
                 raw_bitrate = float(p.get('a_bitrate', 128))
                 if raw_bitrate < 8: raw_bitrate = 128.0
@@ -1201,22 +1398,37 @@ class EncoderWorker(QThread):
                 # it consistently overshoots. Prefer smaller files over overshooting.
                 if is_av1 and duration < 30:
                     safety_margin = 0.85
-                num_audio_streams = len(decodable_audio_indices) if a_codec != "Passthrough" else 0
-                video_kbps = calc_size_mode_bitrate(target_mb, duration, audio_bitrate, num_audio_streams, safety_margin)
+                # Budget for the audio that actually ends up in the file:
+                # encoded audio uses the configured bitrate; passthrough audio
+                # still consumes container space at its measured source bitrate.
+                if a_codec == "Passthrough":
+                    num_audio_streams, budget_audio_bitrate = passthrough_audio_budget(
+                        audio_bitrates, decodable_audio_indices)
+                    unknown_streams = sum(1 for i in decodable_audio_indices
+                                          if i >= len(audio_bitrates) or audio_bitrates[i] <= 0)
+                    if unknown_streams:
+                        self.log_signal.emit(
+                            f"Warning: {unknown_streams} passthrough audio stream(s) publish no "
+                            f"bitrate; assuming {int(PASSTHROUGH_AUDIO_FALLBACK_KBPS)}k each for "
+                            f"the size budget.")
+                else:
+                    num_audio_streams = len(decodable_audio_indices)
+                    budget_audio_bitrate = audio_bitrate
+                video_kbps = calc_size_mode_bitrate(target_mb, duration, budget_audio_bitrate, num_audio_streams, safety_margin)
                 video_kbps = self._clamp_bitrate(video_kbps)
 
                 # === SCALING & AUTO-SWITCH ===
                 if auto_scale and not is_av1:
                     if video_kbps < 200 and target_h > 240:
                         target_h = 240
-                        self.scale_notification_signal.emit(f"240p")
+                        self.scale_notification_signal.emit("240p")
                         force_mitchell = True
                         self.log_signal.emit(f"⚠ Auto-Scale: Forcing 240p (Bitrate {video_kbps}k)")
                         forced_av1 = True
                         quality_preset = "3"
                     elif video_kbps < 500 and target_h > 480:
                         target_h = 480
-                        self.scale_notification_signal.emit(f"480p")
+                        self.scale_notification_signal.emit("480p")
                         force_mitchell = True
                         self.log_signal.emit(f"⚠ Auto-Scale: Forcing 480p (Bitrate {video_kbps}k)")
                         forced_av1 = True
@@ -1228,7 +1440,7 @@ class EncoderWorker(QThread):
                     use_hw = False
                     v_tag = "_av1"
                     forced_av1_margin = 0.85 if duration < 30 else 0.98
-                    video_kbps = calc_size_mode_bitrate(target_mb, duration, audio_bitrate, num_audio_streams, forced_av1_margin)
+                    video_kbps = calc_size_mode_bitrate(target_mb, duration, budget_audio_bitrate, num_audio_streams, forced_av1_margin)
                     video_kbps = self._clamp_bitrate(video_kbps)
                     self.log_signal.emit(f"⚠ Auto-Scale: Forcing 2-pass encoding for optimal quality at low bitrate (margin: {forced_av1_margin:.0%})")
                 else:
@@ -1366,6 +1578,8 @@ class EncoderWorker(QThread):
         else:
             map_flags.extend(["-map_metadata", "-1"])
 
+        is_short_video = video_info.duration < 30
+
         algo = p.get('algo', 'Bicubic')
 
         # --- PIPELINE CONSTRUCTION (SW vs HW) ---
@@ -1421,7 +1635,7 @@ class EncoderWorker(QThread):
                 crf=p.get('crf', 24),
                 pad_right=pad_right,
                 pad_bottom=pad_bottom,
-                is_short_video=video_info.duration < 30,
+                is_short_video=is_short_video,
                 hw_encoder_opts=p.get('hw_encoder_opts', {}),
                 fps=video_info.fps,
                 emit=self.log_signal.emit,
@@ -1430,13 +1644,13 @@ class EncoderWorker(QThread):
         if vf_chain:
             base_cmd.extend(["-vf", ",".join(vf_chain)])
 
-        is_short_video = video_info.duration < 30
-
         # --- Execute ---
         # VP9 supports 2-pass encoding
         # Force 2-pass when auto downscale is triggered (forced_av1)
         # For short videos (<30s), use VBR with tight maxrate for better accuracy
-        run_2pass = (mode == 'size' and not use_hw and video_codec_cmd != "copy" and not is_short_video) and (p.get('two_pass', False) or forced_av1)
+        run_2pass = should_run_2pass(
+            mode, use_hw, video_codec_cmd, is_short_video,
+            bool(p.get('two_pass', False)), forced_av1)
 
         if run_2pass:
             temp_dir = tempfile.gettempdir()
@@ -1444,30 +1658,66 @@ class EncoderWorker(QThread):
             unique_id = str(uuid.uuid4())[:8]
             pass_log_base = os.path.join(temp_dir, f"ffmpeg_2pass_log_{unique_id}")
 
-            cmd_p1 = base_cmd + ["-map", "0:v:0"]
-
             # First pass: AV1/VP9 can use faster presets, x264/x265 must match pass 2
+            codec_flags_p1 = []
             if is_av1:
-                cmd_p1.extend(["-c:v", video_codec_cmd, "-b:v", f"{video_kbps}k", "-preset", "11", "-pix_fmt", "yuv420p10le"])
+                codec_flags_p1 = ["-c:v", video_codec_cmd, "-b:v", f"{video_kbps}k", "-preset", "11", "-pix_fmt", "yuv420p10le"]
                 if video_codec_cmd == "libsvtav1":
                     # Match pass 2's rate control so the 2-pass stats stay valid
-                    cmd_p1.extend(["-g", str(svt_gop_size(video_info.fps)), "-svtav1-params", "gop-constraint-rc=1"])
+                    codec_flags_p1.extend(["-g", str(svt_gop_size(video_info.fps)), "-svtav1-params", "gop-constraint-rc=1"])
             elif is_vp9:
-                cmd_p1.extend(["-c:v", video_codec_cmd, "-b:v", f"{video_kbps}k", "-deadline", "realtime", "-cpu-used", "7", "-row-mt", "1"])
+                codec_flags_p1 = ["-c:v", video_codec_cmd, "-b:v", f"{video_kbps}k", "-deadline", "realtime", "-cpu-used", "7", "-row-mt", "1"]
             elif "libx" in video_codec_cmd:
                 # x264/x265: use video_flags (already has -c:v, -preset, -b:v, -maxrate, -bufsize)
                 # Strip -bsf:v entries (bitstream filter not needed for null output pass 1)
-                cmd_p1.extend(strip_bsf_flags(video_flags))
+                codec_flags_p1 = strip_bsf_flags(video_flags)
 
-            cmd_p1.extend(["-pass", "1", "-passlogfile", pass_log_base, "-an", "-f", "null", os.devnull])
+            hw_2pass_requested = bool(p.get('hw_decode_2pass', False))
+            hw_kwargs = dict(
+                enabled=hw_2pass_requested, can_hw_decode=can_hw_decode,
+                device=device, is_av1=is_av1, fps_filter=fps_filter,
+                target_w=target_w, target_h=target_h,
+                orig_w=orig_w, orig_h=orig_h)
+            pass_tail = ["-pass", "1", "-passlogfile", pass_log_base, "-an", "-f", "null", os.devnull]
+            cmd_p1 = base_cmd + ["-map", "0:v:0"] + list(codec_flags_p1) + list(pass_tail)
+            p1_hw = apply_vaapi_hwdecode(cmd_p1, **hw_kwargs)
+            if p1_hw:
+                self.log_signal.emit("Pass 1: VAAPI hardware decode + GPU scaling")
 
             if not self.run_ffmpeg_process(cmd_p1, "PASS 1"):
-                self.finished_signal.emit(False)
-                return
+                if not p1_hw:
+                    self.finished_signal.emit(False)
+                    return
+                # Some driver/codec combos reject HW decode; the stats file may
+                # be partial, so clear it before retrying with CPU decode.
+                self.log_signal.emit("⚠ HW-decoded pass 1 failed; retrying with CPU decode")
+                for f in glob.glob(f"{pass_log_base}*"):
+                    try:
+                        os.remove(f)
+                    except OSError:
+                        pass
+                cmd_p1 = base_cmd + ["-map", "0:v:0"] + list(codec_flags_p1) + list(pass_tail)
+                if not self.run_ffmpeg_process(cmd_p1, "PASS 1 RETRY (CPU DECODE)"):
+                    self.finished_signal.emit(False)
+                    return
+                # HW decode proved unreliable; keep pass 2 on CPU as well.
+                p1_hw = False
 
             # Second pass: use the actual selected preset (video_flags already contains it)
             cmd_p2 = base_cmd + map_flags + video_flags + ["-pass", "2", "-passlogfile", pass_log_base] + audio_flags + meta_subs_flags + [output_file]
-            success = self.run_ffmpeg_process(cmd_p2, "PASS 2")
+            p2_hw = apply_vaapi_hwdecode(cmd_p2, **{**hw_kwargs, "enabled": p1_hw})
+            if p2_hw:
+                self.log_signal.emit("Pass 2: VAAPI hardware decode + GPU scaling")
+
+            if not self.run_ffmpeg_process(cmd_p2, "PASS 2"):
+                if not p2_hw:
+                    success = False
+                else:
+                    self.log_signal.emit("⚠ HW-decoded pass 2 failed; retrying with CPU decode")
+                    cmd_p2 = base_cmd + map_flags + video_flags + ["-pass", "2", "-passlogfile", pass_log_base] + audio_flags + meta_subs_flags + [output_file]
+                    success = self.run_ffmpeg_process(cmd_p2, "PASS 2 RETRY (CPU DECODE)")
+            else:
+                success = True
 
             try:
                 # Use glob to find all pass log files (handles variations)
@@ -1723,7 +1973,6 @@ class HWDeviceProber(QThread):
         ]
         
         ffmpeg_not_found = False
-        device_error = None
         
         try:
             with ThreadPoolExecutor(max_workers=len(codecs_to_check)) as executor:
@@ -1805,7 +2054,7 @@ class HWDecoderChecker(QThread):
         gpu_vendor = detect_gpu_vendor(self.device_path)
         self.decoder_caps['gpu_vendor'] = gpu_vendor
         self.log_messages.append(f"  Hardware Device: {self.device_path} (GPU: {gpu_vendor.upper()})")
-        self.log_messages.append(f"  Hardware decoder support (VAAPI):")
+        self.log_messages.append("  Hardware decoder support (VAAPI):")
 
         try:
             cmd = [self.ffmpeg_path, "-hide_banner", "-codecs"]
@@ -1936,10 +2185,8 @@ class NotificationManager:
     def _check_command(self, command):
         """Check if a command is available in PATH"""
         try:
-            return subprocess.call(['which', command],
-                                 stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.DEVNULL) == 0
-        except:
+            return shutil.which(command) is not None
+        except Exception:
             return False
     
     def _generate_tone(self, frequency, duration, volume=0.5):
@@ -2067,14 +2314,17 @@ class MainWindow(QMainWindow):
         self.vulkan_available = False
         self.vulkan_capabilities = {}
         self.vulkan_prober = None
+        self._vulkan_probed = False  # True once a Vulkan probe has been scheduled
         
         self.sw_encoder_checker = None
         self.audio_encoder_checker = None
         self.hw_device_prober = None
         self.hw_decoder_checker = None
+        self._retired_probers = []  # Replaced QThreads kept referenced until they finish
         self.hw_encoder_check_complete = False
         self._probing_active = True
         self._initial_probing_done = False
+        self._device_probe_started = False  # True once HW device probing has been scheduled
         self._probe_generation = 0  # Incremented on ffmpeg path change; stale prober results are dropped
         self._failed_count = 0
         
@@ -2185,6 +2435,16 @@ class MainWindow(QMainWindow):
         self.mode_stack.addWidget(self.quality_widget)
 
         vid_layout.addRow(self.target_label, self.mode_stack)
+
+        # Own row: this checkbox is wider than the target-size input row (which
+        # is width-capped), and squeezing it in there clipped its label.
+        self.chk_hw_decode_passes = QCheckBox("HW-Decode Passes")
+        self.chk_hw_decode_passes.setToolTip(
+            "Run both 2-pass stages with VAAPI hardware decoding and GPU scaling\n"
+            "(scale_vaapi). Cuts CPU usage substantially - useful on iGPUs or\n"
+            "while gaming - at some wall-clock speed cost. Off by default.")
+        self.chk_hw_decode_passes.toggled.connect(self.on_hw_decode_passes_toggled)
+        vid_layout.addRow("", self.chk_hw_decode_passes)
 
         c_layout = QHBoxLayout()
         self.v_codec = QComboBox()
@@ -2419,7 +2679,6 @@ class MainWindow(QMainWindow):
         self.chk_hw_decode = QCheckBox("HW Decode")
         self.chk_hw_decode.setChecked(True)
         self.chk_hw_decode.setToolTip("Use Vulkan hardware decoding for ProRes inputs")
-
         self.btn_cancel = QPushButton("Cancel")
         self.btn_cancel.clicked.connect(self.cancel)
         self.btn_cancel.setStyleSheet("background-color: #c62828; color: white; font-weight: bold; padding: 10px;")
@@ -2450,8 +2709,9 @@ class MainWindow(QMainWindow):
         self.update_codec_ui(self.v_codec.currentText())
 
         # Sync widget sizes based on other widgets
-        # Set Target Size widget width to fit input (4 digits), MB label, and 2-Pass checkbox
-        self.size_widget.setFixedWidth(150)
+        # Size widget needs room for the input, "MB", and the 2-Pass checkbox;
+        # a narrower cap compresses them and clips labels.
+        self.size_widget.setFixedWidth(self.size_widget.sizeHint().width())
         # Set Speed Preset to fit "Balanced (Default)" and match Encoding Mode to it
         self.quality_combo.setMinimumWidth(140)
         self.mode_combo.setMinimumWidth(140)
@@ -2525,6 +2785,7 @@ class MainWindow(QMainWindow):
         self.update_preset_options()
 
     def on_2pass_toggled(self, checked):
+        self._sync_hw_decode_passes()
         if checked:
             self.chk_hw.setEnabled(False)
             self.chk_hw.setChecked(False)
@@ -2532,6 +2793,17 @@ class MainWindow(QMainWindow):
             self.chk_hw.setEnabled(True)
 
         self.update_preset_options()
+
+    def on_hw_decode_passes_toggled(self, checked):
+        # The sub-option only makes sense together with 2-pass
+        if checked and not (self.chk_2pass.isEnabled() and self.chk_2pass.isChecked()):
+            self.chk_hw_decode_passes.setChecked(False)
+
+    def _sync_hw_decode_passes(self):
+        """Keep the HW-decode-passes sub-option consistent with the 2-pass state."""
+        active = self.chk_2pass.isEnabled() and self.chk_2pass.isChecked()
+        if not active:
+            self.chk_hw_decode_passes.setChecked(False)
 
     def toggle_mode(self, text):
         if text == "Target Size":
@@ -2552,9 +2824,13 @@ class MainWindow(QMainWindow):
             self.chk_copy_data.setEnabled(True)
             self.res_combo.setEnabled(True)
             self.ar_combo.setEnabled(True)
+            self.fps_combo.setEnabled(True)
+            self.fps_custom_input.setEnabled(True)
             self.algo_combo.setEnabled(True)
             self.chk_auto_scale.setEnabled(True)
             self.mode_stack.setEnabled(True)
+            self.chk_hw_decode_passes.setEnabled(True)
+            self._sync_hw_decode_passes()
         elif text == "Quality":
             self.mode_stack.setCurrentIndex(1)
             self.target_label.setText("Target Quality:")
@@ -2567,14 +2843,20 @@ class MainWindow(QMainWindow):
             self.chk_copy_data.setEnabled(True)
             self.res_combo.setEnabled(True)
             self.ar_combo.setEnabled(True)
+            self.fps_combo.setEnabled(True)
+            self.fps_custom_input.setEnabled(True)
             self.algo_combo.setEnabled(True)
             self.chk_auto_scale.setEnabled(True)
             self.mode_stack.setEnabled(True)
+            # 2-pass (and therefore HW-decode passes) is size-mode only
+            self.chk_hw_decode_passes.setEnabled(False)
+            self._sync_hw_decode_passes()
         elif text == "Passthrough":
             # Disable all video-related options
             self.v_codec.setEnabled(False)
             self.chk_hw.setEnabled(False)
             self.chk_2pass.setEnabled(False)
+            self.chk_hw_decode_passes.setEnabled(False)
             self.quality_combo.setEnabled(False)
             self.chk_copy_data.setEnabled(True)  # Keep copy data enabled
             self.res_combo.setEnabled(False)
@@ -2624,6 +2906,32 @@ class MainWindow(QMainWindow):
 
     # --- SOFTWARE ENCODER DETECTION ---
     
+    def _retire_prober(self, prober):
+        """Park a replaced QThread until it fully finishes.
+
+        Dropping the last Python reference to a still-running QThread can
+        destroy it mid-run and crash the process, so probers replaced while
+        in flight are kept referenced and released on their built-in
+        finished signal.
+        """
+        if prober is None:
+            return
+        if prober.isRunning():
+            self._retired_probers.append(prober)
+
+            def _release(p=prober):
+                try:
+                    self._retired_probers.remove(p)
+                except ValueError:
+                    pass
+
+            prober.finished.connect(_release)
+            # The thread may have finished between isRunning() and connect(),
+            # in which case `finished` has already fired and _release would
+            # never run - leaving the reference parked forever.
+            if not prober.isRunning():
+                _release()
+
     def on_sw_encoders_found(self, available_codecs, generation=None):
         """Handle completion of software encoder checking"""
         if generation is not None and generation != self._probe_generation:
@@ -2631,6 +2939,7 @@ class MainWindow(QMainWindow):
         self.available_sw_codecs = available_codecs
         self.update_codec_options()
         with self._probe_lock:
+            self._retire_prober(self.sw_encoder_checker)
             self.sw_encoder_checker = None
         self._check_probing_complete()
     
@@ -2640,6 +2949,7 @@ class MainWindow(QMainWindow):
             return
         self.available_audio_encoders = available_encoders
         with self._probe_lock:
+            self._retire_prober(self.audio_encoder_checker)
             self.audio_encoder_checker = None
         self._check_probing_complete()
     
@@ -2649,6 +2959,7 @@ class MainWindow(QMainWindow):
             return
         self.device_capabilities[device_path] = capabilities
         with self._probe_lock:
+            self._retire_prober(self.hw_device_prober)
             self.hw_device_prober = None
         self.hw_encoder_check_complete = True
         self._check_probing_complete()
@@ -2660,6 +2971,7 @@ class MainWindow(QMainWindow):
             return
         self.hw_decoder_capabilities[device_path] = decoder_caps
         with self._probe_lock:
+            self._retire_prober(self.hw_decoder_checker)
             self.hw_decoder_checker = None
         self._check_probing_complete()
         self._refresh_codec_ui_if_probing_done()
@@ -2676,14 +2988,19 @@ class MainWindow(QMainWindow):
         self.vulkan_available = has_vulkan
         self.vulkan_capabilities = capabilities
         with self._probe_lock:
+            self._retire_prober(self.vulkan_prober)
             self.vulkan_prober = None
         self._check_probing_complete()
         
         if has_vulkan:
             self.log.append("ProRes Vulkan hardware decode available")
-            self.chk_hw_decode.setToolTip("Use Vulkan hardware decoding for ProRes inputs")
+            self.chk_hw_decode.setToolTip(
+                "Vulkan hardware decoding for ProRes inputs.\n"
+                "(2-pass VAAPI decoding is a separate option: HW-Decode Passes.)")
         else:
-            self.chk_hw_decode.setToolTip("Vulkan ProRes decode not available - will use CPU decode for ProRes")
+            self.chk_hw_decode.setToolTip(
+                "Vulkan ProRes decode unavailable - ProRes decodes on CPU.\n"
+                "(2-pass VAAPI decoding is a separate option: HW-Decode Passes.)")
     
     def _set_ui_enabled(self, enabled, encoding=False):
         """Enable or disable UI during probing/encoding.
@@ -2702,6 +3019,7 @@ class MainWindow(QMainWindow):
         self.v_codec.setEnabled(enabled)
         self.chk_hw.setEnabled(enabled)
         self.chk_2pass.setEnabled(enabled)
+        self.chk_hw_decode_passes.setEnabled(enabled)
         self.quality_combo.setEnabled(enabled)
         self.container_combo.setEnabled(enabled)
         self.output_path.setEnabled(enabled)
@@ -2733,9 +3051,12 @@ class MainWindow(QMainWindow):
         with self._probe_lock:
             sw_done = self.sw_encoder_checker is None
             audio_done = self.audio_encoder_checker is None
-            hw_enc_done = self.hw_device_prober is None
-            hw_dec_done = self.hw_decoder_checker is None
-            vulkan_done = self.vulkan_prober is None or not hasattr(self, '_vulkan_probed')
+            # HW/Vulkan probes are scheduled slightly after the SW/audio
+            # checks (initial_probe runs via QTimer), so completion must not
+            # be declared before they have even been started.
+            hw_enc_done = self._device_probe_started and self.hw_device_prober is None
+            hw_dec_done = self._device_probe_started and self.hw_decoder_checker is None
+            vulkan_done = self.vulkan_prober is None or not self._vulkan_probed
         
         if sw_done and audio_done and hw_enc_done and hw_dec_done and vulkan_done:
             self._probing_active = False
@@ -2784,6 +3105,7 @@ class MainWindow(QMainWindow):
         ffmpeg_cmd = self._current_ffmpeg_cmd()
         gen = self._probe_generation
         
+        self._retire_prober(self.sw_encoder_checker)
         self.probing_coordinator.reset(['sw_encoders'])
         self._start_probe_timeout_timer()
         
@@ -2798,6 +3120,7 @@ class MainWindow(QMainWindow):
         ffmpeg_cmd = self._current_ffmpeg_cmd()
         gen = self._probe_generation
         
+        self._retire_prober(self.audio_encoder_checker)
         self.probing_coordinator.reset(['audio_encoders'])
         self._start_probe_timeout_timer()
         
@@ -2891,11 +3214,20 @@ class MainWindow(QMainWindow):
         ffmpeg_cmd = self._current_ffmpeg_cmd()
         gen = self._probe_generation
 
+        self._retire_prober(self.hw_device_prober)
+        self._retire_prober(self.hw_decoder_checker)
+        self._retire_prober(self.vulkan_prober)
+        self.hw_device_prober = None
+        self.hw_decoder_checker = None
+        self.vulkan_prober = None
+
         prober_ids = ['hw_encoders', 'hw_decoders']
-        if not hasattr(self, '_vulkan_probed'):
+        if not self._vulkan_probed:
             prober_ids.append('vulkan')
-            self._vulkan_probed = True
+        self._vulkan_probed = True
+        self._device_probe_started = True
         self.probing_coordinator.reset(prober_ids)
+        self._start_probe_timeout_timer()
 
         self.hw_device_prober = HWDeviceProber(ffmpeg_cmd, device_path)
         self.hw_device_prober.log_signal.connect(lambda msg: self._on_prober_log('hw_encoders', msg))
@@ -2922,9 +3254,7 @@ class MainWindow(QMainWindow):
         is_hevc = "H.265" in codec_text
         is_vp9 = "VP9" in codec_text
 
-        use_hw = self.chk_hw.isChecked()
         current_device = self.device_combo.currentText()
-
         caps = self.device_capabilities.get(current_device, {'av1': False, 'h264': False, 'hevc': False, 'vp9': False})
 
         hw_supported = False
@@ -2979,6 +3309,7 @@ class MainWindow(QMainWindow):
 
         self.chk_hw.blockSignals(False)
         self.chk_2pass.blockSignals(False)
+        self._sync_hw_decode_passes()
 
         self.update_preset_options()
     
@@ -3094,7 +3425,9 @@ class MainWindow(QMainWindow):
     def inhibit_sleep(self):
         try:
             cmd = ["systemd-inhibit", "--what=idle:sleep", "--who=VAAPI-Transcoder", "--why=Encoding", "--mode=block", "sleep", "infinity"]
-            self.sleep_inhibitor = subprocess.Popen(cmd)
+            # Own process group so release_sleep can take down the wrapper and
+            # its `sleep infinity` child together
+            self.sleep_inhibitor = subprocess.Popen(cmd, start_new_session=True)
             self.log.append("System sleep inhibited.")
         except Exception as e:
             self.log.append(f"Warning: Could not inhibit system sleep ({e})")
@@ -3102,10 +3435,13 @@ class MainWindow(QMainWindow):
     def release_sleep(self):
         if self.sleep_inhibitor:
             try:
-                self.sleep_inhibitor.terminate()
+                try:
+                    os.killpg(self.sleep_inhibitor.pid, signal.SIGTERM)
+                except (ProcessLookupError, PermissionError):
+                    self.sleep_inhibitor.terminate()
                 self.sleep_inhibitor.wait(timeout=5)
                 self.log.append("System sleep lock released.")
-            except (subprocess.TimeoutExpired, OSError, Exception) as e:
+            except Exception as e:
                 self.log.append(f"Warning: Error releasing sleep lock: {e}")
             self.sleep_inhibitor = None
 
@@ -3395,6 +3731,7 @@ class MainWindow(QMainWindow):
             # currentData() returns None for unset items; 0 is a valid preset
             'quality_preset': qp_data if qp_data is not None else 3,
             'two_pass': self.chk_2pass.isChecked(),
+            'hw_decode_2pass': self.chk_2pass.isChecked() and self.chk_hw_decode_passes.isChecked(),
             'res_choice': self.res_combo.currentText(),
             'ar_choice': self.ar_combo.currentText(),
             'fps_choice': fps_choice,
@@ -3486,9 +3823,7 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'timer'):
             self.timer.stop()
 
-        # Access is_cancelled with proper thread synchronization
-        with self.worker._process_lock:
-            was_cancelled = self.worker.is_cancelled
+        was_cancelled = self.worker.was_cancelled()
         
         if not success and not was_cancelled:
             self._failed_count += 1
@@ -3501,9 +3836,10 @@ class MainWindow(QMainWindow):
             item = self.queue_list.item(0)
             if item:
                 fpath = item.data(Qt.UserRole)
-                self.queue_list.takeItem(0)
-                # Remove from _queue_paths to allow re-adding the same file
-                self._queue_paths.discard(fpath)
+                with self._queue_paths_lock:
+                    self.queue_list.takeItem(0)
+                    # Remove from _queue_paths to allow re-adding the same file
+                    self._queue_paths.discard(fpath)
                 # Update placeholder visibility when queue becomes empty
                 self.update_queue_placeholder()
                 # Re-enable add button to allow adding new files after each job completes
@@ -3552,6 +3888,9 @@ class MainWindow(QMainWindow):
                 reply = QMessageBox.question(self, "Exit", "Transcoding in progress. Exit?", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
                 if reply == QMessageBox.Yes:
                     self.worker.cancel()
+                    # Let the worker thread finish tearing down ffmpeg before
+                    # the Qt objects are destroyed on exit
+                    self.worker.wait(15000)
                     event.accept()
                 else:
                     event.ignore()

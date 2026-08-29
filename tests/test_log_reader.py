@@ -60,12 +60,34 @@ class TestNeverStopsReading:
     def test_reader_drains_past_emit_cap(self, m):
         # regression: the old loop broke after MAX_EMIT lines, letting the pipe
         # fill and blocking ffmpeg forever. The reader must keep draining.
-        lines = "frame= 1\n" * (m.EncoderOutputReader.MAX_EMIT + 500)
+        total = m.EncoderOutputReader.MAX_EMIT + 500
+        lines = "frame= 1\n" * total
         reader, logs, _, _ = make_reader(m, lines, video_duration=0.0)
-        suppressed = reader.read_loop()
-        assert suppressed == 500
-        assert len(logs) >= m.EncoderOutputReader.MAX_EMIT
+        reader.read_loop()
+        # Every line was consumed from the stream (no early stop, no hang).
+        assert reader.lines_seen == total
+        # The emit cap bounded what reached the UI.
+        assert len(logs) < total
         assert any("suppressed" in l for l in logs)
+
+    def test_redundant_progress_lines_are_throttled(self, m):
+        # A long encode emits "frame=" many times per second; only lines where
+        # the completion percentage advances should reach the log.
+        lines = ("frame=   1 time=00:00:01.00 bitrate=N/A\n" * 3
+                 + "frame= 500 time=00:00:50.00 bitrate=N/A\n" * 3
+                 + "frame= 990 time=00:01:39.00 bitrate=N/A\n")
+        reader, logs, progress, _ = make_reader(m, lines, video_duration=100.0)
+        reader.read_loop()
+        assert len([l for l in logs if "frame=" in l]) == 3
+        assert progress == [1, 1, 1, 50, 50, 50, 99]
+
+    def test_errors_are_never_throttled(self, m):
+        lines = ("frame=   1 time=00:00:01.00\n" * 5
+                 + "Error while decoding stream\n"
+                 + "frame=   2 time=00:00:02.00\n")
+        reader, logs, _, _ = make_reader(m, lines, video_duration=100.0)
+        reader.read_loop()
+        assert any("Error while decoding" in l for l in logs)
 
     def test_cancellation_stops_loop(self, m):
         state = {"n": 0}

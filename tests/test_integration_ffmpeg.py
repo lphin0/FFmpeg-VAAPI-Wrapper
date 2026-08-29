@@ -103,6 +103,52 @@ class TestSoftwareEncode:
         assert w.run() is True
         assert output_file(tmp_path, "sample", "_h264", ".mp4")
 
+    @needs_hw
+    def test_h264_size_2pass_hw_decoded_passes(self, m, tmp_path):
+        # >=30s so the non-short path (real 2-pass) triggers; caps enable the
+        # VAAPI-decoded passes with automatic CPU fallback on failure.
+        src = tmp_path / "long_sample_hw.mp4"
+        result = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-y",
+             "-f", "lavfi", "-i", "testsrc=duration=31:size=640x480:rate=30",
+             "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", str(src)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+        if result.returncode != 0:
+            pytest.skip("could not generate long sample video")
+        w = CaptureWorker(m, job_params(m, src, tmp_path,
+                                        mode="size", size="5", two_pass=True,
+                                        hw_decode_2pass=True,
+                                        hw_decoder_caps={"h264": True, "gpu_vendor": "amd"}))
+        assert w.run() is True
+        assert output_file(tmp_path, "long_sample_hw", "_h264", ".mp4")
+        if "PASS 1 RETRY" not in w.log_text:
+            assert "Pass 1: VAAPI hardware decode + GPU scaling" in w.log_text
+            assert "-hwaccel_output_format vaapi" in w.log_text
+            assert "scale_vaapi=" in w.log_text
+            assert "hwdownload" in w.log_text
+
+    @needs_hw
+    @pytest.mark.skipif(not _encoder_available("libsvtav1"), reason="libsvtav1 missing")
+    def test_av1_size_2pass_hw_decoded_av1_source(self, m, tmp_path):
+        # AV1 source exercises VAAPI AV1 decode (RDNA2+) in both passes
+        src = tmp_path / "long_av1_src.mp4"
+        result = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-y",
+             "-f", "lavfi", "-i", "testsrc=duration=31:size=640x480:rate=30",
+             "-c:v", "libsvtav1", "-preset", "11", "-crf", "32", str(src)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+        if result.returncode != 0:
+            pytest.skip("could not generate long AV1 sample video")
+        w = CaptureWorker(m, job_params(m, src, tmp_path,
+                                        mode="size", size="5", v_codec="AV1",
+                                        two_pass=True, hw_decode_2pass=True,
+                                        hw_decoder_caps={"av1": True, "gpu_vendor": "amd"}))
+        assert w.run() is True
+        assert output_file(tmp_path, "long_av1_src", "_av1", ".mp4")
+        if "PASS 1 RETRY" not in w.log_text:
+            assert "Pass 1: VAAPI hardware decode + GPU scaling" in w.log_text
+            assert "scale_vaapi=format=p010le" in w.log_text
+
     @pytest.mark.skipif(not _encoder_available("libsvtav1"), reason="libsvtav1 missing")
     def test_av1_quality(self, m, sample_video, tmp_path):
         w = CaptureWorker(m, job_params(m, sample_video, tmp_path, v_codec="AV1"))
@@ -142,10 +188,29 @@ class TestSoftwareEncode:
         assert w.run() is True
 
     def test_compat_block_webm_hevc(self, m, sample_video, tmp_path):
+        # Opus audio is legal in WebM, so this isolates the video-codec block
         w = CaptureWorker(m, job_params(m, sample_video, tmp_path,
-                                        v_codec="H.265", container="WEBM"))
+                                        v_codec="H.265", container="WEBM",
+                                        a_codec="Opus"))
         assert w.run() is False
         assert any("not compatible" in msg for msg in w.warnings)
+
+    def test_compat_block_webm_aac(self, m, sample_video, tmp_path):
+        # regression: encoded AAC into WebM used to fail with a raw muxer
+        # error instead of the friendly compatibility dialog
+        w = CaptureWorker(m, job_params(m, sample_video, tmp_path,
+                                        v_codec="VP9", container="WEBM",
+                                        a_codec="AAC"))
+        assert w.run() is False
+        assert any("AAC audio is not supported in the WEBM container" in msg
+                   for msg in w.warnings)
+
+    def test_compat_block_mov_opus(self, m, sample_video, tmp_path):
+        w = CaptureWorker(m, job_params(m, sample_video, tmp_path,
+                                        container="MOV", a_codec="Opus"))
+        assert w.run() is False
+        assert any("Opus audio is not supported in the MOV container" in msg
+                   for msg in w.warnings)
 
     def test_pcm_mp4_blocked(self, m, sample_video, tmp_path):
         w = CaptureWorker(m, job_params(m, sample_video, tmp_path, a_codec="PCM"))

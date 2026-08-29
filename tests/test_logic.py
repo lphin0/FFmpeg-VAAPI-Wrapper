@@ -1,6 +1,4 @@
 """Unit tests for the pure decision logic extracted from EncoderWorker."""
-import os
-
 import pytest
 
 FFMPEG_OPTS_SAMPLE = """
@@ -100,6 +98,37 @@ class TestAlignResolution:
         assert m.align_resolution(1, 1) == (64, 16)
 
 
+class TestCheckDiskSpace:
+    def _worker(self, m):
+        return m.EncoderWorker({"input": "x", "v_codec": "H.264"})
+
+    def test_existing_directory_is_measured(self, m, tmp_path):
+        worker = self._worker(m)
+        has_space, available, required = worker.check_disk_space(str(tmp_path / "o.mp4"), 10.0)
+        assert required == 11.0  # 10% safety margin
+        assert available == available  # finite, from statvfs
+
+    def test_missing_directory_does_not_report_zero_bytes(self, m, tmp_path):
+        # regression: an uncreated output dir reported available=0, which the
+        # caller read as "out of disk" and logged a bogus low-space warning
+        worker = self._worker(m)
+        target = str(tmp_path / "not_yet_created" / "o.mp4")
+        has_space, available, _ = worker.check_disk_space(target, 10.0)
+        assert has_space is True
+        assert available == float("inf")
+
+    def test_insufficient_space_detected(self, m, tmp_path, monkeypatch):
+        worker = self._worker(m)
+
+        class FakeStat:
+            f_bavail = 1
+            f_frsize = 1024  # ~1 MB free
+
+        monkeypatch.setattr(m.os, "statvfs", lambda _p: FakeStat())
+        has_space, available, required = worker.check_disk_space(str(tmp_path / "o.mp4"), 1000.0)
+        assert has_space is False
+
+
 class TestCalcSizeModeBitrate:
     def test_single_audio_stream(self, m):
         # 2.1GiB 5m13s file, 20MiB target, 128kbps audio, 1 stream
@@ -137,6 +166,24 @@ class TestParseFrameRate:
         assert m.parse_frame_rate("") == 0.0
         assert m.parse_frame_rate("N/A") == 0.0
         assert m.parse_frame_rate("garbage") == 0.0
+
+
+class TestStreamBitrateKbps:
+    def test_bit_rate_field(self, m):
+        assert m.stream_bitrate_kbps({"bit_rate": "192000"}) == 192.0
+
+    def test_estimated_from_size_and_duration(self, m):
+        # 240000 bytes over 10s = 192000 bps = 192 kbps
+        assert m.stream_bitrate_kbps({"size": "240000", "duration": "10.0"}) == 192.0
+
+    def test_bit_rate_preferred_over_estimate(self, m):
+        assert m.stream_bitrate_kbps({"bit_rate": "128000", "size": "240000", "duration": "10.0"}) == 128.0
+
+    def test_unknown_fields(self, m):
+        assert m.stream_bitrate_kbps({}) == 0.0
+        assert m.stream_bitrate_kbps({"bit_rate": "N/A"}) == 0.0
+        assert m.stream_bitrate_kbps({"size": "100"}) == 0.0
+        assert m.stream_bitrate_kbps({"size": "x", "duration": "y"}) == 0.0
 
 
 class TestSvtGopSize:
@@ -314,10 +361,21 @@ class TestBuildVideoFlags:
         assert "-preset" in flags and "medium" in flags
 
     def test_hevc_padding_bsf(self, m):
+        # VAAPI pads internally to alignment, so the crop metadata is wanted
         flags = m.build_video_flags(**{
-            **FLAG_KWARGS, "video_codec_cmd": "libx265", "pad_right": 4, "pad_bottom": 16,
+            **FLAG_KWARGS, "video_codec_cmd": "hevc_vaapi", "use_hw": True,
+            "pad_right": 4, "pad_bottom": 16,
             "mode": "size", "video_kbps": 500})
         assert "-bsf:v" in flags and "hevc_metadata=crop_right=4:crop_bottom=16" in flags
+
+    def test_hevc_padding_bsf_not_applied_to_software(self, m):
+        # regression: software encoders output the exact resolution, so the
+        # alignment crop was cutting real content (e.g. 8px off 1080p)
+        flags = m.build_video_flags(**{
+            **FLAG_KWARGS, "video_codec_cmd": "libx265",
+            "pad_right": 0, "pad_bottom": 8,
+            "mode": "size", "video_kbps": 500})
+        assert "-bsf:v" not in flags
         flags = m.build_video_flags(**{**FLAG_KWARGS, "video_codec_cmd": "libx265"})
         assert "-bsf:v" not in flags
 
@@ -379,6 +437,20 @@ class TestBuildVfChain:
         _, vf, _ = m.build_vf_chain(**{**VF_KWARGS, "use_hw": False, "target_w": 1280, "target_h": 720})
         assert vf[0] == "scale=1280:720:flags=bicubic"
 
+    def test_software_path_applies_fps_filter(self, m):
+        # regression: the fps filter was dropped in the Full Software path,
+        # silently ignoring framerate changes on all 2-pass (SW) encodes
+        _, vf, _ = m.build_vf_chain(**{
+            **VF_KWARGS, "use_hw": False, "fps_filter": "fps=24",
+            "target_w": 1280, "target_h": 720})
+        assert vf[0] == "fps=24"
+        assert vf[1] == "scale=1280:720:flags=bicubic"
+        assert vf[2] == "format=yuv420p"
+
+    def test_software_path_applies_fps_filter_no_scaling(self, m):
+        _, vf, _ = m.build_vf_chain(**{**VF_KWARGS, "use_hw": False, "fps_filter": "fps=24"})
+        assert vf == ["fps=24", "format=yuv420p"]
+
     def test_cpu_decode_upload_path(self, m):
         extras, vf, name = m.build_vf_chain(**VF_KWARGS)
         assert "-init_hw_device" in extras and f"vaapi=va:{VF_KWARGS['device']}" in extras
@@ -433,6 +505,16 @@ class TestBuildVfChain:
             **VF_KWARGS, "use_vulkan_decode": True, "force_cpu_path": True})
         assert "CPU Decode" in name
 
+    def test_vulkan_path_falls_back_when_fps_filter_set(self, m):
+        # regression: the Vulkan pipeline had no slot for the fps filter and
+        # silently ignored framerate changes for ProRes inputs
+        _, vf, name = m.build_vf_chain(**{
+            **VF_KWARGS, "use_vulkan_decode": True, "input_codec": "prores",
+            "is_prores": True, "fps_filter": "fps=24"})
+        assert vf[0] == "fps=24"
+        assert "hwupload" in vf
+        assert "Vulkan" not in name
+
     def test_av1_hw_uses_cpu_path_with_10bit(self, m):
         # AV1 encoding always uses the CPU-decode path (special 10-bit handling)
         extras, vf, name = m.build_vf_chain(**{
@@ -441,3 +523,176 @@ class TestBuildVfChain:
         assert "format=yuv420p10le" in vf
         assert "hwupload" in vf
         assert "CPU Decode" in name
+
+
+class TestApplyVaapiHwdecode:
+    def _cmd(self):
+        return ["ffmpeg", "-hide_banner", "-y", "-i", "/tmp/in.mp4",
+                "-vf", "scale=1280:720:flags=bicubic,format=yuv420p",
+                "-c:v", "libsvtav1", "-preset", "8"]
+
+    def _kw(self, **over):
+        kw = dict(enabled=True, can_hw_decode=True,
+                  device="/dev/dri/renderD128",
+                  is_av1=False, fps_filter="", target_w=1280, target_h=720,
+                  orig_w=1920, orig_h=1080)
+        kw.update(over)
+        return kw
+
+    def test_downscale_moves_scaling_to_gpu(self, m):
+        cmd = self._cmd()
+        assert m.apply_vaapi_hwdecode(cmd, **self._kw()) is True
+        assert cmd[3:9] == ["-hwaccel", "vaapi", "-hwaccel_output_format",
+                            "vaapi", "-hwaccel_device", "/dev/dri/renderD128"]
+        assert cmd[9:11] == ["-i", "/tmp/in.mp4"]
+        vf = cmd[cmd.index("-vf") + 1]
+        assert vf == ("scale_vaapi=w=1280:h=720:format=nv12,"
+                      "hwdownload,format=nv12,format=yuv420p")
+        assert "scale=" not in vf
+        assert cmd[-4:] == ["-c:v", "libsvtav1", "-preset", "8"]
+
+    def test_no_resize_uses_format_only_scale_vaapi(self, m):
+        cmd = self._cmd()
+        kw = self._kw(target_w=1920, target_h=1080)
+        assert m.apply_vaapi_hwdecode(cmd, **kw) is True
+        vf = cmd[cmd.index("-vf") + 1]
+        assert vf == "scale_vaapi=format=nv12,hwdownload,format=nv12,format=yuv420p"
+
+    def test_av1_targets_p010le_and_preserves_10bit(self, m):
+        cmd = ["ffmpeg", "-y", "-i", "/tmp/in.mp4",
+               "-vf", "format=yuv420p10le", "-c:v", "libsvtav1"]
+        kw = self._kw(is_av1=True, target_w=1920, target_h=1080)
+        assert m.apply_vaapi_hwdecode(cmd, **kw) is True
+        vf = cmd[cmd.index("-vf") + 1]
+        assert vf == ("scale_vaapi=format=p010le,hwdownload,format=p010le,"
+                      "format=yuv420p10le")
+
+    def test_fps_filter_survives_download(self, m):
+        # regression: the software fps filter cannot run on VAAPI frames and
+        # must be re-inserted after hwdownload
+        cmd = self._cmd()
+        kw = self._kw(fps_filter="fps=24")
+        assert m.apply_vaapi_hwdecode(cmd, **kw) is True
+        vf = cmd[cmd.index("-vf") + 1]
+        assert vf == ("scale_vaapi=w=1280:h=720:format=nv12,hwdownload,"
+                      "format=nv12,fps=24,format=yuv420p")
+
+    def test_caller_vf_chain_cannot_leak_into_command(self, m):
+        # regression: the old implementation copied unknown filters from the
+        # caller's chain, so a trailing hwupload (GPU frames) or a duplicate
+        # software scale could end up in front of a software encoder
+        cmd = ["ffmpeg", "-y", "-i", "in.mp4",
+               "-vf", "fps=24,scale=1280:720:flags=lanczos,format=yuv420p,hwupload",
+               "-c:v", "libx264"]
+        assert m.apply_vaapi_hwdecode(cmd, **self._kw()) is True
+        vf = cmd[cmd.index("-vf") + 1]
+        assert vf == ("scale_vaapi=w=1280:h=720:format=nv12,"
+                      "hwdownload,format=nv12,format=yuv420p")
+        assert "hwupload" not in vf
+        assert "scale=" not in vf
+        assert "fps=" not in vf
+
+    @pytest.mark.parametrize("prereq", ["enabled", "can_hw_decode", "device"])
+    def test_prerequisite_missing_leaves_command_unchanged(self, m, prereq):
+        kwargs = self._kw()
+        kwargs[prereq] = False if prereq != "device" else ""
+        cmd = self._cmd()
+        assert m.apply_vaapi_hwdecode(cmd, **kwargs) is False
+        assert cmd == self._cmd()
+
+    def test_missing_vf_or_i_refuses_to_mutate(self, m):
+        assert m.apply_vaapi_hwdecode(["ffmpeg", "-y", "-i", "in.mp4"],
+                                      **self._kw()) is False
+        cmd_no_i = ["ffmpeg", "-y", "-vf", "format=yuv420p"]
+        before = list(cmd_no_i)
+        assert m.apply_vaapi_hwdecode(cmd_no_i, **self._kw()) is False
+        assert cmd_no_i == before
+
+
+class TestPassthroughAudioBudget:
+    def test_all_bitrates_known(self, m):
+        assert m.passthrough_audio_budget([128.0, 192.0], [0, 1]) == (2, 160.0)
+
+    def test_unknown_streams_use_fallback(self, m):
+        # MKV publishes no per-stream bit_rate at all
+        n, avg = m.passthrough_audio_budget([0.0, 0.0], [0, 1])
+        assert n == 2
+        assert avg == m.PASSTHROUGH_AUDIO_FALLBACK_KBPS
+
+    def test_mixed_known_and_unknown(self, m):
+        n, avg = m.passthrough_audio_budget([384.0, 0.0], [0, 1])
+        assert n == 2
+        assert avg == (384.0 + m.PASSTHROUGH_AUDIO_FALLBACK_KBPS) / 2
+
+    def test_mixed_totals_are_preserved(self, m):
+        # calc_size_mode_bitrate multiplies avg by count, so the reserve must
+        # equal the sum of the per-stream figures.
+        rates = [384.0, 0.0, 128.0]
+        n, avg = m.passthrough_audio_budget(rates, [0, 1, 2])
+        assert n * avg == pytest.approx(384.0 + m.PASSTHROUGH_AUDIO_FALLBACK_KBPS + 128.0)
+
+    def test_no_streams_is_free(self, m):
+        assert m.passthrough_audio_budget([], []) == (0, 0.0)
+
+    def test_index_beyond_list_counts_as_unknown(self, m):
+        n, avg = m.passthrough_audio_budget([128.0], [0, 1])
+        assert n == 2
+        assert avg == (128.0 + m.PASSTHROUGH_AUDIO_FALLBACK_KBPS) / 2
+
+
+class TestShouldRun2Pass:
+    def test_explicit_2pass_long_video(self, m):
+        assert m.should_run_2pass("size", False, "libx264", False, True, False) is True
+
+    def test_explicit_2pass_short_video_skipped(self, m):
+        # Short clips use single-pass VBR with a tight maxrate instead
+        assert m.should_run_2pass("size", False, "libx264", True, True, False) is False
+
+    def test_forced_av1_overrides_short_video(self, m):
+        # regression: auto-scale forced 2-pass but `not is_short_video` gated
+        # the whole expression, so short clips silently stayed single-pass
+        assert m.should_run_2pass("size", False, "libsvtav1", True, False, True) is True
+
+    def test_not_requested(self, m):
+        assert m.should_run_2pass("size", False, "libx264", False, False, False) is False
+
+    def test_never_for_hardware(self, m):
+        assert m.should_run_2pass("size", True, "hevc_vaapi", False, True, True) is False
+
+    def test_never_for_passthrough(self, m):
+        assert m.should_run_2pass("size", False, "copy", False, True, False) is False
+
+    def test_never_for_quality_mode(self, m):
+        assert m.should_run_2pass("quality", False, "libx264", False, True, False) is False
+
+
+class TestVaapiDeviceReuse:
+    def _kw(self):
+        return dict(enabled=True, can_hw_decode=True, device="/dev/dri/renderD128",
+                    is_av1=False, fps_filter="", target_w=1280, target_h=720,
+                    orig_w=1920, orig_h=1080)
+
+    def test_reuses_named_device_already_on_command(self, m):
+        # regression: -hwaccel_device repeated the raw path, making FFmpeg open
+        # the DRM node a second time instead of reusing the declared instance
+        cmd = ["ffmpeg", "-hide_banner", "-y",
+               "-init_hw_device", "vaapi=va:/dev/dri/renderD128",
+               "-filter_hw_device", "va",
+               "-i", "in.mp4", "-vf", "format=yuv420p", "-c:v", "libx264"]
+        assert m.apply_vaapi_hwdecode(cmd, **self._kw()) is True
+        idx = cmd.index("-hwaccel_device")
+        assert cmd[idx + 1] == "va"
+
+    def test_falls_back_to_path_without_init_hw_device(self, m):
+        cmd = ["ffmpeg", "-y", "-i", "in.mp4", "-vf", "format=yuv420p", "-c:v", "libx264"]
+        assert m.apply_vaapi_hwdecode(cmd, **self._kw()) is True
+        idx = cmd.index("-hwaccel_device")
+        assert cmd[idx + 1] == "/dev/dri/renderD128"
+
+    def test_ignores_device_for_different_path(self, m):
+        cmd = ["ffmpeg", "-y",
+               "-init_hw_device", "vaapi=other:/dev/dri/renderD129",
+               "-i", "in.mp4", "-vf", "format=yuv420p", "-c:v", "libx264"]
+        assert m.apply_vaapi_hwdecode(cmd, **self._kw()) is True
+        idx = cmd.index("-hwaccel_device")
+        assert cmd[idx + 1] == "/dev/dri/renderD128"
