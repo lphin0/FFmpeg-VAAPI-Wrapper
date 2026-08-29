@@ -1,7 +1,58 @@
 """Offscreen GUI tests for MainWindow."""
-import os
-
+from PySide6.QtCore import QThread
 from PySide6.QtWidgets import QMessageBox
+
+
+class TestHwDecodePassesCheckbox:
+    def test_not_clipped_in_its_own_row(self, m, window):
+        # regression: the checkbox was crammed into the width-capped
+        # target-size row and its label was clipped to a few pixels
+        w = window
+        assert w.chk_hw_decode_passes.width() >= w.chk_hw_decode_passes.sizeHint().width()
+
+    def test_only_in_size_mode(self, window):
+        w = window
+        w.mode_combo.setCurrentText("Target Size")
+        assert w.chk_hw_decode_passes.isEnabled()
+        w.mode_combo.setCurrentText("Quality")
+        assert not w.chk_hw_decode_passes.isEnabled()
+        # Not usable without 2-pass, so it must not stay checked
+        assert not w.chk_hw_decode_passes.isChecked()
+
+    def test_unchecks_when_2pass_disabled(self, window):
+        w = window
+        w.mode_combo.setCurrentText("Target Size")
+        w.chk_hw.setChecked(False)
+        w.chk_2pass.setEnabled(True)
+        w.chk_2pass.setChecked(True)
+        w.chk_hw_decode_passes.setChecked(True)
+        assert w.chk_hw_decode_passes.isChecked()
+        w.chk_2pass.setChecked(False)
+        assert not w.chk_hw_decode_passes.isChecked()
+
+    def test_batch_params_gate_on_2pass(self, m, window, monkeypatch, tmp_path):
+        w = window
+        captured = {}
+        monkeypatch.setattr(m.MainWindow, "process_next_job", lambda self: captured.update(self.batch_params))
+        f = tmp_path / "in_hw2p.mp4"
+        f.write_bytes(b"x")
+        w.add_path_to_queue(str(f))
+        w.mode_combo.setCurrentText("Target Size")
+        w.chk_hw.setChecked(False)
+        w.chk_2pass.setChecked(True)
+        w.chk_hw_decode_passes.setChecked(True)
+        w.start_queue()
+        assert captured["hw_decode_2pass"] is True
+
+        # Without 2-pass the sub-option must not leak into the job
+        w.clear_queue()
+        f2 = tmp_path / "in_hw2p_off.mp4"
+        f2.write_bytes(b"x")
+        w.add_path_to_queue(str(f2))
+        w.chk_2pass.setChecked(False)
+        w.chk_hw_decode_passes.setChecked(True)
+        w.start_queue()
+        assert captured["hw_decode_2pass"] is False
 
 
 class TestContainerValidation:
@@ -148,15 +199,11 @@ class TestJobOutcomeTracking:
         w._failed_count = 0
 
         class FakeWorker:
-            class _Lock:
-                def __enter__(self):
-                    return self
-
-                def __exit__(self, *a):
-                    return False
-            _process_lock = _Lock()
-            is_cancelled = False
+            was_cancelled_flag = False
             params = {"input": str(f)}
+
+            def was_cancelled(self):
+                return self.was_cancelled_flag
 
             def isRunning(self):
                 return False
@@ -166,6 +213,29 @@ class TestJobOutcomeTracking:
         assert w._failed_count == 1
         assert w.queue_list.count() == 0
         assert any("failed" in w.log.toPlainText().lower() for _ in [0])
+
+    def test_cancelled_job_keeps_queue(self, window, m, monkeypatch, tmp_path):
+        w = window
+        monkeypatch.setattr(m.MainWindow, "process_next_job", lambda self: None)
+        f = tmp_path / "in.mp4"
+        f.write_bytes(b"x")
+        w.add_path_to_queue(str(f))
+        w._total_jobs = 1
+        w._failed_count = 0
+
+        class FakeWorker:
+            params = {"input": str(f)}
+
+            def was_cancelled(self):
+                return True
+
+            def isRunning(self):
+                return False
+
+        w.worker = FakeWorker()
+        w.job_finished(False)
+        assert w._failed_count == 0  # cancellations are not failures
+        assert w.queue_list.count() == 1  # cancelled queue is preserved
 
     def test_all_finished_reports_failures(self, window, monkeypatch):
         w = window
@@ -188,6 +258,21 @@ class TestJobOutcomeTracking:
         assert messages and "successfully" in messages[0]
 
 
+class TestToggleMode:
+    def test_leaving_passthrough_reenables_fps_controls(self, window):
+        # regression: fps_combo/fps_custom_input stayed disabled after
+        # selecting Passthrough mode and switching back
+        w = window
+        w.mode_combo.setCurrentText("Passthrough")
+        assert not w.fps_combo.isEnabled()
+        w.mode_combo.setCurrentText("Target Size")
+        assert w.fps_combo.isEnabled()
+        assert w.fps_custom_input.isEnabled()
+        w.mode_combo.setCurrentText("Quality")
+        assert w.fps_combo.isEnabled()
+        assert w.fps_custom_input.isEnabled()
+
+
 class TestProbingLifecycle:
     def test_probe_timeout_unblocks_ui(self, window):
         w = window
@@ -196,6 +281,59 @@ class TestProbingLifecycle:
         w._on_probe_timeout(31.0)
         assert w.btn_start.isEnabled()
         assert w._probing_active is False
+
+    def test_probing_not_complete_before_device_probe_scheduled(self, window):
+        # regression: SW/audio checks finishing before initial_probe ran
+        # declared probing complete and stopped the timeout watchdog before
+        # the HW/Vulkan probes had even been started
+        w = window
+        w._probing_active = True
+        w.sw_encoder_checker = None
+        w.audio_encoder_checker = None
+        w.hw_device_prober = None
+        w.hw_decoder_checker = None
+        w._device_probe_started = False
+        w._check_probing_complete()
+        assert w._probing_active is True
+
+        w._device_probe_started = True
+        w._check_probing_complete()
+        assert w._probing_active is False
+
+    def test_vulkan_reprobed_after_flag_reset(self, window, m, monkeypatch):
+        # regression: on_ffmpeg_path_changed reset _vulkan_probed to False but
+        # probe_device checked hasattr(), so Vulkan was never re-probed
+        w = window
+        w._vulkan_probed = False
+        monkeypatch.setattr(m.HWDeviceProber, "start", lambda self: None)
+        monkeypatch.setattr(m.HWDecoderChecker, "start", lambda self: None)
+        monkeypatch.setattr(m.VulkanDeviceProber, "start", lambda self: None)
+        w.probe_device("/dev/dri/renderD129")
+        assert w._vulkan_probed is True
+        assert w.vulkan_prober is not None
+        assert w.hw_device_prober is not None
+        assert w._device_probe_started is True
+
+    def test_retired_prober_kept_referenced_until_finished(self, window, qapp):
+        # regression: replaced probers lost their last Python reference while
+        # still running, which can crash the process (QThread destroyed mid-run)
+        import time
+        w = window
+
+        class Sleepy(QThread):
+            def run(self):
+                time.sleep(0.05)
+
+        old = Sleepy()
+        old.start()
+        w._retire_prober(old)
+        assert old in w._retired_probers
+        assert old.wait(2000)
+        deadline = time.time() + 2
+        while old in w._retired_probers and time.time() < deadline:
+            qapp.processEvents()
+            time.sleep(0.01)
+        assert old not in w._retired_probers
 
     def test_generation_guard_drops_stale_results(self, window):
         w = window

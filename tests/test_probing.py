@@ -1,8 +1,6 @@
 """Tests for ProbingCoordinator (ordered log flushing, timeout) and HW prober wiring."""
 import time
 
-import pytest
-
 
 class TestProbingCoordinator:
     def test_single_reset_flush(self, m):
