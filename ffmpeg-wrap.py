@@ -680,7 +680,12 @@ class EncoderOutputReader:
 
     TIME_PATTERN = re.compile(r'time=(\d{2}):(\d{2}):(\d{2}\.\d+)')
     KEYWORD_PATTERN = re.compile(r'frame=|Error|Stream #|kb/s|kB time=|error|Invalid argument', re.IGNORECASE)
-    ALWAYS_LOG_PATTERN = re.compile(r'Error|Stream #|kb/s|kB time=|error|Invalid argument', re.IGNORECASE)
+    # Lines that must always reach the UI regardless of throttling: errors,
+    # stream mapping, and ffmpeg's final summary line ("Lsize="). The progress
+    # marker "kB time=" is deliberately absent: real ffmpeg progress lines
+    # ("size= ...kB time=...") contain it, so listing it here forwarded every
+    # progress line and defeated the throttle on builds that print "kB".
+    ALWAYS_LOG_PATTERN = re.compile(r'Error|Stream #|kb/s|Lsize=|error|Invalid argument', re.IGNORECASE)
     MAX_EMIT = 10000
     SUPPRESSION_NOTICE_EVERY = 1000
 

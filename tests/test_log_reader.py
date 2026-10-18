@@ -81,6 +81,29 @@ class TestNeverStopsReading:
         assert len([l for l in logs if "frame=" in l]) == 3
         assert progress == [1, 1, 1, 50, 50, 50, 99]
 
+    def test_real_ffmpeg_progress_lines_are_throttled(self, m):
+        # regression: ALWAYS_LOG_PATTERN contained "kB time=", which is a
+        # substring of the real ffmpeg progress line ("size= ...kB time=..."),
+        # so on builds that print "kB" every progress line was forwarded and
+        # the throttle did nothing.
+        line = ("frame=   1 fps=25 q=28.0 size=     256kB time=00:00:10.00 "
+                "bitrate= 524.3kbits/s speed=1.00x")
+        reader, logs, _, _ = make_reader(m, (line + "\n") * 5, video_duration=100.0)
+        reader.read_loop()
+        # Same percentage every time: only the first (start-of-encode) line.
+        assert len([l for l in logs if "frame=" in l]) == 1
+        assert any("suppressed" in l for l in logs)
+
+    def test_end_summary_always_logged(self, m):
+        # The final "Lsize=" summary must pass through even when the
+        # percentage no longer advances.
+        lines = ("frame= 990 size=  9900kB time=00:01:39.00\n"
+                 + "frame=1000 Lsize= 10000kB time=00:01:40.00\n"
+                 + "frame=1000 Lsize= 10000kB time=00:01:40.00\n")
+        reader, logs, _, _ = make_reader(m, lines, video_duration=100.0)
+        reader.read_loop()
+        assert len([l for l in logs if "Lsize=" in l]) == 2
+
     def test_errors_are_never_throttled(self, m):
         lines = ("frame=   1 time=00:00:01.00\n" * 5
                  + "Error while decoding stream\n"
