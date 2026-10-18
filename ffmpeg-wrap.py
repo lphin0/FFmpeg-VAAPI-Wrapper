@@ -731,7 +731,8 @@ class EncoderOutputReader:
         return suppressed
 
     def _should_log(self, line: str, percent: Optional[int],
-                    last_percent: int, emitted: int, keyword_hit) -> bool:
+                    last_percent: int, emitted: int,
+                    keyword_hit: Optional[re.Match]) -> bool:
         """Decide whether a line is worth sending to the UI.
 
         keyword_hit is the caller's KEYWORD_PATTERN match (reused to avoid
@@ -2361,6 +2362,7 @@ class MainWindow(QMainWindow):
         # refreshes (e.g. async probe completion) must then not stomp them
         self._hw_prefs_touched = False
         self._last_ui_codec = None  # Codec the codec-UI defaults were last applied for
+        self._last_ui_device = None  # Device the codec-UI defaults were last applied for
         self._failed_count = 0
         
         self.probing_coordinator = ProbingCoordinator()
@@ -2855,67 +2857,52 @@ class MainWindow(QMainWindow):
             self.chk_hw_decode_passes.setChecked(False)
 
     def toggle_mode(self, text):
+        # Checked-state defaults apply only on a real mode change. reset_ui()
+        # re-applies enablement through _apply_mode_enablement() instead, so it
+        # never rewrites the user's 2-pass choice after a queue finishes.
+        if text == "Target Size" and not self.chk_hw.isChecked():
+            # Default to checking it if we switch to size mode and are in SW
+            self.chk_2pass.setChecked(True)
+        elif text != "Passthrough":
+            self.chk_2pass.setChecked(False)
+        # Passthrough leaves checked states untouched
+
+        self._apply_mode_enablement(text)
+
+    def _apply_mode_enablement(self, text):
+        """Enable/disable controls for the given mode without touching checks.
+
+        Shared by toggle_mode() (user changes mode) and reset_ui() (re-enabling
+        the UI after a queue). Only enablement is applied here; callers own any
+        checked-state defaults.
+        """
+        video_enabled = text != "Passthrough"
+
         if text == "Target Size":
             self.mode_stack.setCurrentIndex(0)
             self.target_label.setText("Target Size (MB):")
-            # If HW is off, enable 2-pass. If HW is on, keep 2-pass off.
-            if not self.chk_hw.isChecked():
-                self.chk_2pass.setEnabled(True)
-                # Default to checking it if we switch to size mode and are in SW
-                self.chk_2pass.setChecked(True)
-            else:
-                self.chk_2pass.setEnabled(False)
-                self.chk_2pass.setChecked(False)
-            # Enable video-related options
-            self.v_codec.setEnabled(True)
-            self.quality_combo.setEnabled(True)
-            self.chk_copy_data.setEnabled(True)
-            self.res_combo.setEnabled(True)
-            self.ar_combo.setEnabled(True)
-            self.fps_combo.setEnabled(True)
-            self.fps_custom_input.setEnabled(True)
-            self.algo_combo.setEnabled(True)
-            self.chk_auto_scale.setEnabled(True)
-            self.mode_stack.setEnabled(True)
-            self.chk_hw_decode_passes.setEnabled(True)
-            self._sync_hw_decode_passes()
         elif text == "Quality":
             self.mode_stack.setCurrentIndex(1)
             self.target_label.setText("Target Quality:")
-            self.chk_2pass.setEnabled(False)
-            self.chk_2pass.setChecked(False)
-            # Enable video-related options
-            self.v_codec.setEnabled(True)
-            self.quality_combo.setEnabled(True)
-            self.chk_copy_data.setEnabled(True)
-            self.res_combo.setEnabled(True)
-            self.ar_combo.setEnabled(True)
-            self.fps_combo.setEnabled(True)
-            self.fps_custom_input.setEnabled(True)
-            self.algo_combo.setEnabled(True)
-            self.chk_auto_scale.setEnabled(True)
-            self.mode_stack.setEnabled(True)
-            # 2-pass (and therefore HW-decode passes) is size-mode only
-            self.chk_hw_decode_passes.setEnabled(False)
-            self._sync_hw_decode_passes()
-        elif text == "Passthrough":
-            # Disable all video-related options
-            self.v_codec.setEnabled(False)
-            self.chk_hw.setEnabled(False)
-            self.chk_2pass.setEnabled(False)
-            self.chk_hw_decode_passes.setEnabled(False)
-            self.quality_combo.setEnabled(False)
-            self.chk_copy_data.setEnabled(True)  # Keep copy data enabled
-            self.res_combo.setEnabled(False)
-            self.ar_combo.setEnabled(False)
-            self.fps_combo.setEnabled(False)
-            self.fps_custom_input.setEnabled(False)
-            self.algo_combo.setEnabled(False)
-            self.chk_auto_scale.setEnabled(False)
-            self.mode_stack.setEnabled(False)
+
+        # Enable/disable video-related options
+        self.v_codec.setEnabled(video_enabled)
+        self.quality_combo.setEnabled(video_enabled)
+        self.chk_copy_data.setEnabled(True)  # Keep copy data enabled
+        self.res_combo.setEnabled(video_enabled)
+        self.ar_combo.setEnabled(video_enabled)
+        self.fps_combo.setEnabled(video_enabled)
+        self.fps_custom_input.setEnabled(video_enabled)
+        self.algo_combo.setEnabled(video_enabled)
+        self.chk_auto_scale.setEnabled(video_enabled)
+        self.mode_stack.setEnabled(video_enabled)
+        # 2-pass (and therefore HW-decode passes) is size-mode only
+        self.chk_hw_decode_passes.setEnabled(text == "Target Size")
 
         # HW/2-pass enablement always follows device support for the codec
         self._update_hw_2pass_enablement()
+        if video_enabled:
+            self._sync_hw_decode_passes()
 
     def validate_container_codec(self):
         """Validate container and codec compatibility in real-time"""
@@ -3407,11 +3394,20 @@ class MainWindow(QMainWindow):
         # later. Only the former may change checked states - an explicit user
         # choice (e.g. ticking 2-pass) must never be silently replaced by
         # "HW + 1-pass" when a probe thread completes afterwards.
+        #
+        # A device switch is treated like a codec change: the old choice may
+        # not be honorable on the new device (it might not HW-encode the codec
+        # at all), so defaults are re-evaluated for the new (codec, device)
+        # pair instead of leaving a checked-but-unsupported HW box.
         codec_changed = codec_text != self._last_ui_codec
+        device_changed = current_device != self._last_ui_device
         if codec_changed:
             self._last_ui_codec = codec_text
+        if device_changed:
+            self._last_ui_device = current_device
+        if codec_changed or device_changed:
             self._hw_prefs_touched = False
-        apply_defaults = codec_changed or not self._hw_prefs_touched
+        apply_defaults = codec_changed or device_changed or not self._hw_prefs_touched
 
         self.chk_hw.blockSignals(True)
         self.chk_2pass.blockSignals(True)
@@ -3724,6 +3720,10 @@ class MainWindow(QMainWindow):
         self.vulkan_available = False
         self.vulkan_capabilities = {}
         self._vulkan_probed = False  # Reset Vulkan probe flag
+        # Device probes are about to be re-scheduled; until probe_device() runs,
+        # completion must not be declared (a warm probe cache restores results
+        # synchronously, and a stale True here would enable the UI early).
+        self._device_probe_started = False
         self.update_codec_options()
         
         # Start new checks (stale prober results are ignored via generation)
@@ -4014,8 +4014,9 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(0)
         # _set_ui_enabled(True) re-enables every control; re-apply the current
         # mode's enable/disable state so e.g. Passthrough keeps video options
-        # greyed out after a queue finishes.
-        self.toggle_mode(self.mode_combo.currentText())
+        # greyed out after a queue finishes. Only enablement is re-applied -
+        # the user's checked choices (e.g. 2-pass) must survive.
+        self._apply_mode_enablement(self.mode_combo.currentText())
 
     def cancel(self):
         if self.worker and self.worker.isRunning():

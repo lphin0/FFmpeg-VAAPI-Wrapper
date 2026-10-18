@@ -284,6 +284,22 @@ class TestToggleMode:
         assert not w.fps_combo.isEnabled()
         assert not w.res_combo.isEnabled()
 
+    def test_reset_ui_keeps_user_2pass_choice(self, window):
+        # regression: reset_ui() went through toggle_mode(), which re-checked
+        # 2-pass behind the user's back after every queue
+        w = window
+        w.mode_combo.setCurrentText("Target Size")
+        w.device_capabilities[w.device_combo.currentText()] = {
+            "av1": False, "h264": True, "hevc": True, "vp9": False, "encoder_options": {}}
+        w.v_codec.setCurrentText("AV1")
+        w.update_codec_ui("AV1")
+        assert w.chk_2pass.isChecked()  # default ON for SW size mode
+        w.chk_2pass.click()  # user turns 2-pass OFF
+        assert not w.chk_2pass.isChecked()
+        w.reset_ui()
+        assert not w.chk_2pass.isChecked()
+        assert w.chk_2pass.isEnabled()
+
 
 class TestHwTwoPassEnablement:
     """HW and 2-pass are mutually exclusive; HW needs device support."""
@@ -368,6 +384,52 @@ class TestHwTwoPassEnablement:
         assert w.chk_hw.isChecked()
         assert not w.chk_2pass.isChecked()
 
+    def _two_devices(self, w):
+        w.device_combo.blockSignals(True)
+        w.device_combo.clear()
+        w.device_combo.addItems(["/dev/dri/renderD128", "/dev/dri/renderD129"])
+        w.device_combo.setCurrentIndex(0)
+        w.device_combo.blockSignals(False)
+
+    def _device_caps(self, w):
+        w.device_capabilities["/dev/dri/renderD128"] = {
+            "av1": True, "h264": True, "hevc": True, "vp9": False, "encoder_options": {}}
+        w.device_capabilities["/dev/dri/renderD129"] = {
+            "av1": False, "h264": False, "hevc": False, "vp9": False, "encoder_options": {}}
+
+    def test_device_switch_unchecks_unsupported_hw(self, window):
+        # regression: a deliberate HW choice survived a device switch, leaving
+        # HW checked (but disabled) on a device that cannot encode the codec -
+        # start_queue then used use_hw=True and the encode failed
+        w = window
+        self._two_devices(w)
+        self._device_caps(w)
+        w.mode_combo.setCurrentText("Target Size")
+        w.v_codec.setCurrentText("AV1")
+        w.update_codec_ui("AV1")
+        assert w.chk_hw.isChecked()  # renderD128 supports HW AV1
+        w._hw_prefs_touched = True  # user made an explicit HW/2-pass choice
+        w.device_combo.setCurrentIndex(1)  # switch to a device without HW AV1
+        w.update_codec_ui("AV1")
+        assert not w.chk_hw.isChecked()
+        assert not w.chk_hw.isEnabled()
+
+    def test_device_switch_to_supported_restores_hw_default(self, window):
+        # a device switch re-evaluates defaults in both directions
+        w = window
+        self._two_devices(w)
+        self._device_caps(w)
+        w.mode_combo.setCurrentText("Target Size")
+        w.v_codec.setCurrentText("AV1")
+        w.update_codec_ui("AV1")
+        w.device_combo.setCurrentIndex(1)
+        w.update_codec_ui("AV1")
+        assert not w.chk_hw.isChecked()
+        w.device_combo.setCurrentIndex(0)
+        w.update_codec_ui("AV1")
+        assert w.chk_hw.isChecked()
+        assert not w.chk_2pass.isChecked()
+
 
 class TestProbingLifecycle:
     def test_probe_timeout_unblocks_ui(self, window):
@@ -395,6 +457,19 @@ class TestProbingLifecycle:
         w._device_probe_started = True
         w._check_probing_complete()
         assert w._probing_active is False
+
+    def test_ffmpeg_path_change_resets_device_probe_started(self, window, monkeypatch):
+        # regression: on_ffmpeg_path_changed() left _device_probe_started True,
+        # so a warm probe cache restored the SW/audio results synchronously and
+        # _check_probing_complete() declared probing done (enabling the UI)
+        # before probe_device() had run
+        w = window
+        monkeypatch.setattr(w, "probe_device", lambda device: None)
+        w._device_probe_started = True
+        w._probing_active = True
+        w.on_ffmpeg_path_changed()
+        assert w._device_probe_started is False
+        assert w._probing_active is True
 
     def test_vulkan_reprobed_after_flag_reset(self, window, m, monkeypatch):
         # regression: on_ffmpeg_path_changed reset _vulkan_probed to False but
