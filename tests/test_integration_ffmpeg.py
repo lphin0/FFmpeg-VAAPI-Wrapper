@@ -102,6 +102,9 @@ class TestSoftwareEncode:
                                         mode="size", size="5", two_pass=True))
         assert w.run() is True
         assert output_file(tmp_path, "sample", "_h264", ".mp4")
+        # regression: short clips used to silently run single-pass despite
+        # the 2-pass checkbox being checked
+        assert "PASS 1" in w.log_text and "PASS 2" in w.log_text
 
     @needs_hw
     def test_h264_size_2pass_hw_decoded_passes(self, m, tmp_path):
@@ -173,6 +176,16 @@ class TestSoftwareEncode:
         assert w.run() is True
         assert output_file(tmp_path, "long_sample", "_av1", ".mp4")
         assert "-g 150" in w.log_text and "gop-constraint-rc=1" in w.log_text
+
+    @pytest.mark.skipif(not _encoder_available("libsvtav1"), reason="libsvtav1 missing")
+    def test_av1_size_2pass_short_clip_honors_checkbox(self, m, sample_video, tmp_path):
+        # regression: the 2-pass checkbox was silently ignored for clips <30s,
+        # so AV1 encodes "always" ran single-pass
+        w = CaptureWorker(m, job_params(m, sample_video, tmp_path,
+                                        mode="size", size="5", v_codec="AV1",
+                                        two_pass=True))
+        assert w.run() is True
+        assert "PASS 1" in w.log_text and "PASS 2" in w.log_text
 
     @pytest.mark.skipif(not _encoder_available("libvpx-vp9"), reason="libvpx-vp9 missing")
     def test_vp9_quality_auto_container(self, m, sample_video, tmp_path):

@@ -141,6 +141,11 @@ def codec_key_from_ui(codec_text: str) -> str:
 # subprocess call.
 FFPROBE_TIMEOUT = 60
 
+# Upper bound for the log widget's document. The per-job emit cap limits a
+# single job's output, but the document would still grow across a long queue,
+# and QTextEdit appends get slower as the document grows.
+LOG_MAX_BLOCKS = 5000
+
 
 def validate_input_file(filepath: str) -> Optional[str]:
     """Validate that an input file exists, is a regular file, and is readable.
@@ -288,20 +293,18 @@ def svt_gop_size(fps: Optional[float] = None) -> int:
 
 
 def should_run_2pass(mode: str, use_hw: bool, video_codec_cmd: str,
-                     is_short_video: bool, two_pass_requested: bool,
-                     forced_av1: bool) -> bool:
+                     two_pass_requested: bool, forced_av1: bool) -> bool:
     """Decide whether a size-mode encode runs as two passes.
 
-    2-pass only applies to software size-mode encodes of real video. Short
-    clips (<30s) normally use single-pass VBR with a tight maxrate, which
-    tracks the target better than 2-pass does at that length - but an
-    auto-scale "forced AV1" switch always wants 2-pass, even for short clips.
+    2-pass applies to software size-mode encodes of real video whenever it is
+    requested (the checkbox) or forced by the auto-scale switch. The checkbox
+    is always honored, including on short clips: a checked box must visibly
+    mean 2-pass. Single-pass VBR with a tight maxrate is still available by
+    unchecking the box.
     """
     if mode != 'size' or use_hw or video_codec_cmd == "copy":
         return False
-    if not (two_pass_requested or forced_av1):
-        return False
-    return forced_av1 or not is_short_video
+    return two_pass_requested or forced_av1
 
 
 def calc_size_mode_bitrate(target_mb: float, duration: float, audio_bitrate: float,
@@ -539,8 +542,9 @@ def build_vf_chain(*, input_file: str, device: str, video_codec_cmd: str, use_hw
 
     # The fps filter operates on software frames, so any framerate change
     # requires the CPU decode path (fps -> hw frames fails at filter negotiation).
+    # AV1 10-bit output no longer forces this path: the universal pipeline
+    # converts surfaces to p010le on the GPU via scale_vaapi.
     use_software_scaler = (
-        is_av1 or
         algo != "VAAPI (HW)" or
         force_mitchell or
         bool(fps_filter) or
@@ -590,18 +594,12 @@ def build_vf_chain(*, input_file: str, device: str, video_codec_cmd: str, use_hw
         "-filter_hw_device", "va",
     ]
 
-    # Use scale_vaapi for both scaling and format conversion
+    # Use scale_vaapi for both scaling and format conversion; pix_fmt is the
+    # VAAPI surface format (p010le for 10-bit AV1, nv12 otherwise).
     if target_w != orig_w or target_h != orig_h:
-        if is_av1:
-            # AV1 10-bit hw encode: use p010le for hardware surface
-            vf_chain.append(f"scale_vaapi=w={target_w}:h={target_h}:format=p010le")
-        else:
-            vf_chain.append(f"scale_vaapi=w={target_w}:h={target_h}:format={pix_fmt}")
+        vf_chain.append(f"scale_vaapi=w={target_w}:h={target_h}:format={pix_fmt}")
     else:
-        if is_av1:
-            vf_chain.append("scale_vaapi=format=p010le")
-        else:
-            vf_chain.append(f"scale_vaapi=format={pix_fmt}")
+        vf_chain.append(f"scale_vaapi=format={pix_fmt}")
     return extras, vf_chain, "Universal VAAPI HW/SW Decode -> Encode"
 
 
@@ -713,7 +711,8 @@ class EncoderOutputReader:
             if not line:
                 continue
             percent = self._parse_progress(line)
-            if self._should_log(line, percent, last_percent, emitted):
+            keyword_hit = self.KEYWORD_PATTERN.search(line)
+            if self._should_log(line, percent, last_percent, emitted, keyword_hit):
                 if emitted < self.MAX_EMIT:
                     self.log_cb(line)
                     emitted += 1
@@ -721,7 +720,7 @@ class EncoderOutputReader:
                     suppressed += 1
                     if suppressed % self.SUPPRESSION_NOTICE_EVERY == 0:
                         self.log_cb(f"(suppressing further log output, {suppressed} lines dropped)")
-            elif self.KEYWORD_PATTERN.search(line):
+            elif keyword_hit:
                 # Redundant progress line: still counted, so the emit cap
                 # bounds total output even on pathological encodes.
                 suppressed += 1
@@ -732,11 +731,15 @@ class EncoderOutputReader:
         return suppressed
 
     def _should_log(self, line: str, percent: Optional[int],
-                    last_percent: int, emitted: int) -> bool:
-        """Decide whether a line is worth sending to the UI."""
+                    last_percent: int, emitted: int, keyword_hit) -> bool:
+        """Decide whether a line is worth sending to the UI.
+
+        keyword_hit is the caller's KEYWORD_PATTERN match (reused to avoid
+        searching the line twice).
+        """
         if self.ALWAYS_LOG_PATTERN.search(line):
             return True
-        if self.KEYWORD_PATTERN.search(line):
+        if keyword_hit:
             # Bare progress line: show the first one (start of encode) and
             # then only when the completion percentage advances.
             if percent is not None and percent != last_percent:
@@ -746,7 +749,7 @@ class EncoderOutputReader:
 
     def _parse_progress(self, line: str) -> Optional[int]:
         """Update progress/ETA from a line; returns the new percent, if any."""
-        if self.video_duration <= 0:
+        if self.video_duration <= 0 or 'time=' not in line:
             return None
         match = self.TIME_PATTERN.search(line)
         if not match:
@@ -822,6 +825,11 @@ class ProbingCoordinator:
                     
                     if self.timeout_callback:
                         self.timeout_callback(elapsed)
+                    # Drop flushed logs and mark the cycle closed, so a
+                    # straggler prober finishing later cannot re-flush stale
+                    # entries a second time.
+                    self.completed_logs = {}
+                    self.start_time = None
                     return True
         return False
     
@@ -1053,7 +1061,9 @@ class EncoderWorker(QThread):
 
             is_prores = codec in ('prores', 'prores_aw', 'prores_ks')
             has_alpha = False
-            if is_prores and codec == 'prores_ks':
+            if is_prores:
+                # ffprobe reports codec_name 'prores' (prores_ks/prores_aw are
+                # encoder names), so alpha is detected from the pixel format.
                 pix_fmt = video_stream.get('pix_fmt', '')
                 if 'yuva' in pix_fmt or 'ya' in pix_fmt or '4444' in pix_fmt:
                     has_alpha = True
@@ -1450,6 +1460,7 @@ class EncoderWorker(QThread):
                         self.log_signal.emit(f"Target: {target_mb}MB | Video: {video_kbps}k | Codec: {video_codec_cmd}")
 
             except ValueError:
+                self.log_signal.emit(f"Error: Invalid target size '{p.get('size')}'.")
                 self.finished_signal.emit(False)
                 return
         else:
@@ -1598,7 +1609,9 @@ class EncoderWorker(QThread):
             use_hw_decode = p.get('use_hw_decode', False)
             can_hw_decode = hw_decoder_caps.get(input_codec, False)
             use_vulkan_decode = is_prores and use_hw_decode and vulkan_available
-            pix_fmt = "yuv420p10le" if (is_av1 and "av1_vaapi" in video_codec_cmd) else "nv12"
+            # GPU-side surface format: VAAPI 10-bit surfaces are p010le
+            # (yuv420p10le is the software-side equivalent).
+            pix_fmt = "p010le" if (is_av1 and "av1_vaapi" in video_codec_cmd) else "nv12"
 
             vf_kwargs = dict(
                 input_file=input_file,
@@ -1647,9 +1660,9 @@ class EncoderWorker(QThread):
         # --- Execute ---
         # VP9 supports 2-pass encoding
         # Force 2-pass when auto downscale is triggered (forced_av1)
-        # For short videos (<30s), use VBR with tight maxrate for better accuracy
+        # Without 2-pass, short videos (<30s) use VBR with a tight maxrate
         run_2pass = should_run_2pass(
-            mode, use_hw, video_codec_cmd, is_short_video,
+            mode, use_hw, video_codec_cmd,
             bool(p.get('two_pass', False)), forced_av1)
 
         if run_2pass:
@@ -1664,7 +1677,10 @@ class EncoderWorker(QThread):
                 codec_flags_p1 = ["-c:v", video_codec_cmd, "-b:v", f"{video_kbps}k", "-preset", "11", "-pix_fmt", "yuv420p10le"]
                 if video_codec_cmd == "libsvtav1":
                     # Match pass 2's rate control so the 2-pass stats stay valid
-                    codec_flags_p1.extend(["-g", str(svt_gop_size(video_info.fps)), "-svtav1-params", "gop-constraint-rc=1"])
+                    if is_short_video:
+                        codec_flags_p1.extend(["-svtav1-params", f"tbr={video_kbps}"])
+                    else:
+                        codec_flags_p1.extend(["-g", str(svt_gop_size(video_info.fps)), "-svtav1-params", "gop-constraint-rc=1"])
             elif is_vp9:
                 codec_flags_p1 = ["-c:v", video_codec_cmd, "-b:v", f"{video_kbps}k", "-deadline", "realtime", "-cpu-used", "7", "-row-mt", "1"]
             elif "libx" in video_codec_cmd:
@@ -1685,7 +1701,7 @@ class EncoderWorker(QThread):
                 self.log_signal.emit("Pass 1: VAAPI hardware decode + GPU scaling")
 
             if not self.run_ffmpeg_process(cmd_p1, "PASS 1"):
-                if not p1_hw:
+                if self.is_cancelled or not p1_hw:
                     self.finished_signal.emit(False)
                     return
                 # Some driver/codec combos reject HW decode; the stats file may
@@ -1871,6 +1887,7 @@ class AudioEncoderChecker(QThread):
     
     def run(self):
         self.log_messages.append("Checking audio encoder availability...")
+        probe_ok = True
         
         try:
             cmd = [self.ffmpeg_path, "-hide_banner", "-encoders"]
@@ -1895,19 +1912,23 @@ class AudioEncoderChecker(QThread):
                 self.available_encoders['aac'] = False
                 self.log_messages.append("Audio Encoder: Could not check encoders, assuming native implementations only")
         except FileNotFoundError:
+            probe_ok = False
             self.log_messages.append("Error: FFmpeg not found. Cannot verify audio encoder capabilities.")
             self.available_encoders['opus'] = False
             self.available_encoders['aac'] = False
         except subprocess.TimeoutExpired:
+            probe_ok = False
             self.log_messages.append("Error: Timeout checking audio encoders.")
             self.available_encoders['opus'] = False
             self.available_encoders['aac'] = False
         except Exception as e:
+            probe_ok = False
             self.log_messages.append(f"Error checking audio encoders: {str(e)}")
             self.available_encoders['opus'] = False
             self.available_encoders['aac'] = False
         
-        self.log_messages.append("Audio Encoder: native opus and aac - Available (fallback)")
+        if probe_ok:
+            self.log_messages.append("Audio Encoder: native opus and aac - Available (fallback)")
         
         # Emit all log messages as one consolidated message
         self.log_signal.emit('\n'.join(self.log_messages))
@@ -1957,7 +1978,7 @@ class HWDeviceProber(QThread):
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
             if result.returncode == 0:
                 return parse_encoder_options(result.stdout.decode(errors='replace'))
-        except (subprocess.TimeoutExpired, FileNotFoundError, Exception):
+        except Exception:
             pass
         return set()
     
@@ -2007,11 +2028,18 @@ class HWDeviceProber(QThread):
         else:
             self.capabilities['gpu_vendor'] = gpu_vendor
             # Capture per-encoder option support (e.g. vp9_vaapi compression_level,
-            # av1_vaapi preset) so the encoder flags can be gated at runtime
+            # av1_vaapi preset) so the encoder flags can be gated at runtime.
+            # Query in parallel: each option probe spawns its own ffmpeg, and
+            # doing them sequentially added seconds to startup probing.
             encoder_options = {}
-            for key, codec_name in codecs_to_check:
-                if self.capabilities.get(key):
-                    encoder_options[key] = self._query_encoder_options(codec_name)
+            supported = [(key, name) for key, name in codecs_to_check
+                         if self.capabilities.get(key)]
+            if supported:
+                with ThreadPoolExecutor(max_workers=len(supported)) as executor:
+                    results = executor.map(
+                        lambda item: (item[0], self._query_encoder_options(item[1])),
+                        supported)
+                    encoder_options = dict(results)
             self.capabilities['encoder_options'] = encoder_options
         
         self.log_signal.emit('\n'.join(self.log_messages))
@@ -2320,12 +2348,19 @@ class MainWindow(QMainWindow):
         self.audio_encoder_checker = None
         self.hw_device_prober = None
         self.hw_decoder_checker = None
-        self._retired_probers = []  # Replaced QThreads kept referenced until they finish
+        self._retired_threads = []  # Replaced QThreads kept referenced until they finish
         self.hw_encoder_check_complete = False
         self._probing_active = True
         self._initial_probing_done = False
         self._device_probe_started = False  # True once HW device probing has been scheduled
         self._probe_generation = 0  # Incremented on ffmpeg path change; stale prober results are dropped
+        # (kind, ffmpeg_cmd[, device]) -> probe results; avoids re-running
+        # capability probes when a previously probed ffmpeg/device is selected again
+        self._probe_cache = {}
+        # User has explicitly clicked the HW/2-pass checkboxes: codec-UI
+        # refreshes (e.g. async probe completion) must then not stomp them
+        self._hw_prefs_touched = False
+        self._last_ui_codec = None  # Codec the codec-UI defaults were last applied for
         self._failed_count = 0
         
         self.probing_coordinator = ProbingCoordinator()
@@ -2340,6 +2375,21 @@ class MainWindow(QMainWindow):
         default_font = QApplication.font()
         default_font.setPointSizeF(default_font.pointSizeF() - 1)
         central.setFont(default_font)
+
+        # --- LOG ---
+        # Created early: startup code (e.g. detect_devices() warning about
+        # missing /dev/dri nodes) logs before the layout section below is
+        # reached, and self.log must exist by then. It is added to the layout
+        # later, keeping the visual order unchanged.
+        log_font = QFont("monospace")
+        log_font.setPointSizeF(QApplication.font().pointSizeF() - 3)
+        self.log = QTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setStyleSheet("background-color: #222; color: #eee; font-family: monospace;")
+        self.log.setFont(log_font)
+        self.log.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        # Bound the document so huge logs cannot grow memory or slow appends
+        self.log.document().setMaximumBlockCount(LOG_MAX_BLOCKS)
 
         # --- QUEUE ---
         queue_container = QWidget()
@@ -2622,13 +2672,7 @@ class MainWindow(QMainWindow):
         layout.addLayout(columns_layout)
 
         # --- LOG ---
-        log_font = QFont("monospace")
-        log_font.setPointSizeF(QApplication.font().pointSizeF() - 3)
-        self.log = QTextEdit()
-        self.log.setReadOnly(True)
-        self.log.setStyleSheet("background-color: #222; color: #eee; font-family: monospace;")
-        self.log.setFont(log_font)
-        self.log.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        # (widget created earlier, near the top of __init__)
         layout.addWidget(self.log)
 
         # --- PROGRESS BAR ---
@@ -2694,6 +2738,11 @@ class MainWindow(QMainWindow):
 
         # Connect signals AFTER widgets are created
         self.device_combo.currentIndexChanged.connect(self.on_device_changed)
+
+        # clicked() fires only on real user interaction (setChecked does not),
+        # which is exactly what marks a HW/2-pass choice as deliberate.
+        self.chk_hw.clicked.connect(self._on_hw_pref_clicked)
+        self.chk_2pass.clicked.connect(self._on_hw_pref_clicked)
         
         # Connect validation signals for container/codec compatibility
         self.container_combo.currentTextChanged.connect(self.validate_container_codec)
@@ -2787,11 +2836,11 @@ class MainWindow(QMainWindow):
     def on_2pass_toggled(self, checked):
         self._sync_hw_decode_passes()
         if checked:
-            self.chk_hw.setEnabled(False)
             self.chk_hw.setChecked(False)
-        else:
-            self.chk_hw.setEnabled(True)
-
+        # Never blanket-enable HW here: it is only available when the device
+        # supports hardware encoding for the selected codec.
+        self._update_hw_2pass_enablement()
+        
         self.update_preset_options()
 
     def on_hw_decode_passes_toggled(self, checked):
@@ -2819,7 +2868,6 @@ class MainWindow(QMainWindow):
                 self.chk_2pass.setChecked(False)
             # Enable video-related options
             self.v_codec.setEnabled(True)
-            self.chk_hw.setEnabled(True)
             self.quality_combo.setEnabled(True)
             self.chk_copy_data.setEnabled(True)
             self.res_combo.setEnabled(True)
@@ -2838,7 +2886,6 @@ class MainWindow(QMainWindow):
             self.chk_2pass.setChecked(False)
             # Enable video-related options
             self.v_codec.setEnabled(True)
-            self.chk_hw.setEnabled(True)
             self.quality_combo.setEnabled(True)
             self.chk_copy_data.setEnabled(True)
             self.res_combo.setEnabled(True)
@@ -2866,6 +2913,9 @@ class MainWindow(QMainWindow):
             self.algo_combo.setEnabled(False)
             self.chk_auto_scale.setEnabled(False)
             self.mode_stack.setEnabled(False)
+
+        # HW/2-pass enablement always follows device support for the codec
+        self._update_hw_2pass_enablement()
 
     def validate_container_codec(self):
         """Validate container and codec compatibility in real-time"""
@@ -2906,30 +2956,30 @@ class MainWindow(QMainWindow):
 
     # --- SOFTWARE ENCODER DETECTION ---
     
-    def _retire_prober(self, prober):
-        """Park a replaced QThread until it fully finishes.
+    def _retire_thread(self, thread):
+        """Park a replaced QThread (prober or encoder worker) until it finishes.
 
         Dropping the last Python reference to a still-running QThread can
-        destroy it mid-run and crash the process, so probers replaced while
+        destroy it mid-run and crash the process, so threads replaced while
         in flight are kept referenced and released on their built-in
         finished signal.
         """
-        if prober is None:
+        if thread is None:
             return
-        if prober.isRunning():
-            self._retired_probers.append(prober)
+        if thread.isRunning():
+            self._retired_threads.append(thread)
 
-            def _release(p=prober):
+            def _release(t=thread):
                 try:
-                    self._retired_probers.remove(p)
+                    self._retired_threads.remove(t)
                 except ValueError:
                     pass
 
-            prober.finished.connect(_release)
+            thread.finished.connect(_release)
             # The thread may have finished between isRunning() and connect(),
             # in which case `finished` has already fired and _release would
             # never run - leaving the reference parked forever.
-            if not prober.isRunning():
+            if not thread.isRunning():
                 _release()
 
     def on_sw_encoders_found(self, available_codecs, generation=None):
@@ -2939,7 +2989,7 @@ class MainWindow(QMainWindow):
         self.available_sw_codecs = available_codecs
         self.update_codec_options()
         with self._probe_lock:
-            self._retire_prober(self.sw_encoder_checker)
+            self._retire_thread(self.sw_encoder_checker)
             self.sw_encoder_checker = None
         self._check_probing_complete()
     
@@ -2949,7 +2999,7 @@ class MainWindow(QMainWindow):
             return
         self.available_audio_encoders = available_encoders
         with self._probe_lock:
-            self._retire_prober(self.audio_encoder_checker)
+            self._retire_thread(self.audio_encoder_checker)
             self.audio_encoder_checker = None
         self._check_probing_complete()
     
@@ -2959,7 +3009,7 @@ class MainWindow(QMainWindow):
             return
         self.device_capabilities[device_path] = capabilities
         with self._probe_lock:
-            self._retire_prober(self.hw_device_prober)
+            self._retire_thread(self.hw_device_prober)
             self.hw_device_prober = None
         self.hw_encoder_check_complete = True
         self._check_probing_complete()
@@ -2971,7 +3021,7 @@ class MainWindow(QMainWindow):
             return
         self.hw_decoder_capabilities[device_path] = decoder_caps
         with self._probe_lock:
-            self._retire_prober(self.hw_decoder_checker)
+            self._retire_thread(self.hw_decoder_checker)
             self.hw_decoder_checker = None
         self._check_probing_complete()
         self._refresh_codec_ui_if_probing_done()
@@ -2988,7 +3038,7 @@ class MainWindow(QMainWindow):
         self.vulkan_available = has_vulkan
         self.vulkan_capabilities = capabilities
         with self._probe_lock:
-            self._retire_prober(self.vulkan_prober)
+            self._retire_thread(self.vulkan_prober)
             self.vulkan_prober = None
         self._check_probing_complete()
         
@@ -3039,6 +3089,12 @@ class MainWindow(QMainWindow):
         self.q_spin.setEnabled(enabled)
         if hasattr(self, 'device_combo'):
             self.device_combo.setEnabled(enabled and len(glob.glob("/dev/dri/renderD*")) > 1)
+        
+        if enabled:
+            # Blanket-enabling every control must not leave HW available for
+            # codecs the device cannot hardware-encode, nor 2-pass in modes
+            # that cannot use it.
+            self._update_hw_2pass_enablement()
         
         if encoding and enabled:
             self.release_sleep()
@@ -3095,6 +3151,10 @@ class MainWindow(QMainWindow):
         """Handle log message from prober threads via coordinator for ordered output"""
         self.probing_coordinator.submit_logs(prober_id, message, self._flush_coordinated_logs)
     
+    def _cache_probe_result(self, key, value):
+        """Remember probe results so re-selecting a device/path skips re-probing."""
+        self._probe_cache[key] = value
+    
     def _current_ffmpeg_cmd(self) -> str:
         """Return the current FFmpeg command path, or 'ffmpeg' if unset."""
         ffmpeg_path = self.ffmpeg_path.text().strip() if hasattr(self, 'ffmpeg_path') else ''
@@ -3104,14 +3164,27 @@ class MainWindow(QMainWindow):
         """Check which software encoders are available in the FFmpeg build (threaded)"""
         ffmpeg_cmd = self._current_ffmpeg_cmd()
         gen = self._probe_generation
+        cache_key = ('sw', ffmpeg_cmd)
         
-        self._retire_prober(self.sw_encoder_checker)
+        cached = self._probe_cache.get(cache_key)
+        if cached is not None:
+            # Already probed for this exact ffmpeg binary: restore instantly.
+            self.on_sw_encoders_found(dict(cached), gen)
+            return
+        
+        self._retire_thread(self.sw_encoder_checker)
         self.probing_coordinator.reset(['sw_encoders'])
         self._start_probe_timeout_timer()
         
         self.sw_encoder_checker = SWEncoderChecker(ffmpeg_cmd)
         self.sw_encoder_checker.log_signal.connect(lambda msg: self._on_prober_log('sw_encoders', msg))
-        self.sw_encoder_checker.finished_signal.connect(lambda caps, g=gen: self.on_sw_encoders_found(caps, g))
+        # Cache write and handler share one signal delivery: the handler drops
+        # the prober reference, which cancels any further queued deliveries
+        # from that signal.
+        def _sw_probed(caps, key=cache_key, gen=gen):
+            self._cache_probe_result(key, dict(caps))
+            self.on_sw_encoders_found(caps, gen)
+        self.sw_encoder_checker.finished_signal.connect(_sw_probed)
         self.sw_encoder_checker.warning_signal.connect(self.on_encoder_warning)
         self.sw_encoder_checker.start()
 
@@ -3119,14 +3192,24 @@ class MainWindow(QMainWindow):
         """Check which audio encoders are available in the FFmpeg build (threaded)"""
         ffmpeg_cmd = self._current_ffmpeg_cmd()
         gen = self._probe_generation
+        cache_key = ('audio', ffmpeg_cmd)
         
-        self._retire_prober(self.audio_encoder_checker)
+        cached = self._probe_cache.get(cache_key)
+        if cached is not None:
+            # Already probed for this exact ffmpeg binary: restore instantly.
+            self.on_audio_encoders_found(dict(cached), gen)
+            return
+        
+        self._retire_thread(self.audio_encoder_checker)
         self.probing_coordinator.reset(['audio_encoders'])
         self._start_probe_timeout_timer()
         
         self.audio_encoder_checker = AudioEncoderChecker(ffmpeg_cmd)
         self.audio_encoder_checker.log_signal.connect(lambda msg: self._on_prober_log('audio_encoders', msg))
-        self.audio_encoder_checker.finished_signal.connect(lambda caps, g=gen: self.on_audio_encoders_found(caps, g))
+        def _audio_probed(caps, key=cache_key, gen=gen):
+            self._cache_probe_result(key, dict(caps))
+            self.on_audio_encoders_found(caps, gen)
+        self.audio_encoder_checker.finished_signal.connect(_audio_probed)
         self.audio_encoder_checker.start()
 
     def update_codec_options(self):
@@ -3214,9 +3297,28 @@ class MainWindow(QMainWindow):
         ffmpeg_cmd = self._current_ffmpeg_cmd()
         gen = self._probe_generation
 
-        self._retire_prober(self.hw_device_prober)
-        self._retire_prober(self.hw_decoder_checker)
-        self._retire_prober(self.vulkan_prober)
+        enc_key = ('hw_enc', ffmpeg_cmd, device_path)
+        dec_key = ('hw_dec', ffmpeg_cmd, device_path)
+        vulk_key = ('vulkan', ffmpeg_cmd)
+        need_vulkan = not self._vulkan_probed
+
+        cached_enc = self._probe_cache.get(enc_key)
+        cached_dec = self._probe_cache.get(dec_key)
+        cached_vulk = self._probe_cache.get(vulk_key) if need_vulkan else None
+        if cached_enc is not None and cached_dec is not None and (not need_vulkan or cached_vulk is not None):
+            # Everything needed is already probed for this (ffmpeg, device)
+            # pair: restore the results instantly instead of re-running ffmpeg.
+            self._vulkan_probed = True
+            self._device_probe_started = True
+            self.on_device_encoders_found(device_path, dict(cached_enc), gen)
+            self.on_device_decoders_found(device_path, dict(cached_dec), gen)
+            if need_vulkan:
+                self.on_vulkan_found(cached_vulk[0], dict(cached_vulk[1]), gen)
+            return
+
+        self._retire_thread(self.hw_device_prober)
+        self._retire_thread(self.hw_decoder_checker)
+        self._retire_thread(self.vulkan_prober)
         self.hw_device_prober = None
         self.hw_decoder_checker = None
         self.vulkan_prober = None
@@ -3231,21 +3333,54 @@ class MainWindow(QMainWindow):
 
         self.hw_device_prober = HWDeviceProber(ffmpeg_cmd, device_path)
         self.hw_device_prober.log_signal.connect(lambda msg: self._on_prober_log('hw_encoders', msg))
-        self.hw_device_prober.finished_signal.connect(lambda dev, caps, g=gen: self.on_device_encoders_found(dev, caps, g))
+        def _hw_enc_probed(dev, caps, key=enc_key, gen=gen):
+            self._cache_probe_result(key, dict(caps))
+            self.on_device_encoders_found(dev, caps, gen)
+        self.hw_device_prober.finished_signal.connect(_hw_enc_probed)
         self.hw_device_prober.warning_signal.connect(self.on_device_warning)
         self.hw_device_prober.start()
         
         self.hw_decoder_checker = HWDecoderChecker(ffmpeg_cmd, device_path)
         self.hw_decoder_checker.log_signal.connect(lambda msg: self._on_prober_log('hw_decoders', msg))
-        self.hw_decoder_checker.finished_signal.connect(lambda dev, caps, g=gen: self.on_device_decoders_found(dev, caps, g))
+        def _hw_dec_probed(dev, caps, key=dec_key, gen=gen):
+            self._cache_probe_result(key, dict(caps))
+            self.on_device_decoders_found(dev, caps, gen)
+        self.hw_decoder_checker.finished_signal.connect(_hw_dec_probed)
         self.hw_decoder_checker.warning_signal.connect(self.on_device_warning)
         self.hw_decoder_checker.start()
         
         if 'vulkan' in prober_ids:
             self.vulkan_prober = VulkanDeviceProber(ffmpeg_cmd)
             self.vulkan_prober.log_signal.connect(lambda msg: self._on_prober_log('vulkan', msg))
-            self.vulkan_prober.finished_signal.connect(lambda hv, caps, g=gen: self.on_vulkan_found(hv, caps, g))
+            def _vulkan_probed(hv, caps, key=vulk_key, gen=gen):
+                self._cache_probe_result(key, (bool(hv), dict(caps)))
+                self.on_vulkan_found(hv, caps, gen)
+            self.vulkan_prober.finished_signal.connect(_vulkan_probed)
             self.vulkan_prober.start()
+
+    def _on_hw_pref_clicked(self, *_):
+        """The user explicitly changed HW/2-pass; later refreshes must not stomp it."""
+        self._hw_prefs_touched = True
+
+    def _current_hw_supported(self) -> bool:
+        """Whether the selected device can HW-encode the selected codec."""
+        caps = self.device_capabilities.get(self.device_combo.currentText(), {})
+        return bool(caps.get(codec_key_from_ui(self.v_codec.currentText()), False))
+
+    def _update_hw_2pass_enablement(self):
+        """Enforce the HW / 2-pass mutual-exclusion invariant.
+
+        2-pass is software-only, so it is unavailable while HW is checked, and
+        the HW checkbox is only ever enabled when the device actually supports
+        hardware encoding for the selected codec. Enablement always follows
+        this rule - the user's checked states never re-enable an option the
+        hardware cannot honor.
+        """
+        active = self.mode_combo.currentText() != "Passthrough"
+        size_mode = self.mode_combo.currentText() == "Target Size"
+        self.chk_2pass.setEnabled(active and size_mode and not self.chk_hw.isChecked())
+        self.chk_hw.setEnabled(active and self._current_hw_supported()
+                               and not self.chk_2pass.isChecked())
 
     # --- UI UPDATERS ---
     def update_codec_ui(self, codec_text):
@@ -3267,45 +3402,43 @@ class MainWindow(QMainWindow):
         elif is_vp9:
             hw_supported = caps.get('vp9', False)
 
+        # This handler serves two purposes: applying codec-selection defaults
+        # (codec changed) and re-enforcing enablement when probe results arrive
+        # later. Only the former may change checked states - an explicit user
+        # choice (e.g. ticking 2-pass) must never be silently replaced by
+        # "HW + 1-pass" when a probe thread completes afterwards.
+        codec_changed = codec_text != self._last_ui_codec
+        if codec_changed:
+            self._last_ui_codec = codec_text
+            self._hw_prefs_touched = False
+        apply_defaults = codec_changed or not self._hw_prefs_touched
+
         self.chk_hw.blockSignals(True)
         self.chk_2pass.blockSignals(True)
 
         is_size_mode = self.mode_combo.currentText() == "Target Size"
 
-        # Default Logic:
-        # 1. If HW is supported, Check HW, Uncheck 2-Pass.
-        # 2. If HW is NOT supported, Uncheck HW, Enable & Check 2-Pass (if in Size Mode).
-
-        if hw_supported:
-            self.chk_hw.setEnabled(True)
-            self.chk_hw.setChecked(True) # Check HW by default
-
-            # If HW is active, disable 2-pass
-            self.chk_2pass.setEnabled(False)
-            self.chk_2pass.setChecked(False)
-            # Enable GPU scaling option and set it as default
-            gpu_idx = self.algo_combo.findText("VAAPI (HW)")
-            if gpu_idx >= 0:
-                self.algo_combo.model().item(gpu_idx).setEnabled(True)
-            self.algo_combo.setCurrentText("VAAPI (HW)")
-        else:
-            # HW not supported
-            self.chk_hw.setEnabled(False)
-            self.chk_hw.setChecked(False)
-
-            # We are in SW mode.
-            # If Size mode, default 2-pass ON.
-            if is_size_mode:
-                self.chk_2pass.setEnabled(True)
-                self.chk_2pass.setChecked(True) # Check 2-pass by default for SW
-            else:
-                self.chk_2pass.setEnabled(False)
+        if apply_defaults:
+            # Default Logic:
+            # 1. If HW is supported, Check HW, Uncheck 2-Pass.
+            # 2. If HW is NOT supported, Uncheck HW, Check 2-Pass (if in Size Mode).
+            if hw_supported:
+                self.chk_hw.setChecked(True) # Check HW by default
                 self.chk_2pass.setChecked(False)
-            # Disable GPU scaling option and switch to Bicubic
-            gpu_idx = self.algo_combo.findText("VAAPI (HW)")
-            if gpu_idx >= 0:
-                self.algo_combo.model().item(gpu_idx).setEnabled(False)
-            self.algo_combo.setCurrentText("Bicubic")
+            else:
+                self.chk_hw.setChecked(False)
+                self.chk_2pass.setChecked(is_size_mode) # default 2-pass ON for SW
+
+        # Enablement follows the invariant regardless of defaults vs. user choice
+        self._update_hw_2pass_enablement()
+
+        # GPU scaling availability tracks HW availability; the scaler choice
+        # itself is a user preference and only defaulted on codec changes.
+        gpu_idx = self.algo_combo.findText("VAAPI (HW)")
+        if gpu_idx >= 0:
+            self.algo_combo.model().item(gpu_idx).setEnabled(hw_supported)
+        if apply_defaults:
+            self.algo_combo.setCurrentText("VAAPI (HW)" if hw_supported else "Bicubic")
 
         self.chk_hw.blockSignals(False)
         self.chk_2pass.blockSignals(False)
@@ -3511,7 +3644,8 @@ class MainWindow(QMainWindow):
                     self.fps_custom_input.setText("30")
 
     def show_scale_notification(self, res_text):
-        if not self.chk_no_sound.isChecked():
+        # This is a popup; it must respect "No Popup", not "No Sound".
+        if not self.chk_no_popup.isChecked():
             QMessageBox.information(self, "Auto-Scale", f"Bitrate too low.\nResolution set to {res_text}.")
     
     def show_compatibility_warning(self, message):
@@ -3773,6 +3907,10 @@ class MainWindow(QMainWindow):
         self.timer.timeout.connect(self.update_elapsed_time)
         self.timer.start(1000)  # Update every second
 
+        # The previous worker's thread may still be winding down here (this
+        # runs from its queued finished_signal); retiring it keeps the last
+        # Python reference alive until the thread has fully stopped.
+        self._retire_thread(self.worker)
         self.worker = EncoderWorker(current_job_params)
         self.worker.log_signal.connect(self.log.append)
         self.worker.scale_notification_signal.connect(self.show_scale_notification)
@@ -3874,6 +4012,10 @@ class MainWindow(QMainWindow):
     def reset_ui(self):
         self._set_ui_enabled(True, encoding=True)
         self.progress_bar.setValue(0)
+        # _set_ui_enabled(True) re-enables every control; re-apply the current
+        # mode's enable/disable state so e.g. Passthrough keeps video options
+        # greyed out after a queue finishes.
+        self.toggle_mode(self.mode_combo.currentText())
 
     def cancel(self):
         if self.worker and self.worker.isRunning():

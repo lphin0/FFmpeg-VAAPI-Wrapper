@@ -272,6 +272,102 @@ class TestToggleMode:
         assert w.fps_combo.isEnabled()
         assert w.fps_custom_input.isEnabled()
 
+    def test_reset_ui_reapplies_mode_state(self, window):
+        # regression: reset_ui() re-enabled every control, so the current
+        # mode's greyed-out options lit up again after a queue finished
+        w = window
+        w.mode_combo.setCurrentText("Passthrough")
+        assert not w.fps_combo.isEnabled()
+        w._set_ui_enabled(False, encoding=True)
+        w.reset_ui()
+        assert w.btn_start.isEnabled()
+        assert not w.fps_combo.isEnabled()
+        assert not w.res_combo.isEnabled()
+
+
+class TestHwTwoPassEnablement:
+    """HW and 2-pass are mutually exclusive; HW needs device support."""
+
+    def _no_hw_av1(self, w):
+        w.device_capabilities[w.device_combo.currentText()] = {
+            "av1": False, "h264": True, "hevc": True, "vp9": False, "encoder_options": {}}
+
+    def _hw_av1(self, w):
+        w.device_capabilities[w.device_combo.currentText()] = {
+            "av1": True, "h264": True, "hevc": True, "vp9": False, "encoder_options": {}}
+
+    def test_hw_stays_disabled_without_hw_av1(self, window):
+        # regression: unchecking 2-pass - and switching modes - enabled the HW
+        # checkbox even when the device cannot hardware-encode the codec
+        w = window
+        self._no_hw_av1(w)
+        w.mode_combo.setCurrentText("Target Size")
+        w.v_codec.setCurrentText("AV1")
+        w.update_codec_ui("AV1")
+        assert not w.chk_hw.isEnabled()
+        w.chk_2pass.setChecked(False)  # user disables 2-pass
+        assert not w.chk_hw.isEnabled()
+        w.mode_combo.setCurrentText("Quality")  # mode disables 2-pass
+        assert not w.chk_hw.isEnabled()
+        w.mode_combo.setCurrentText("Target Size")
+        assert not w.chk_hw.isEnabled()
+
+    def test_hw_enabled_when_supported(self, window):
+        w = window
+        self._hw_av1(w)
+        w.mode_combo.setCurrentText("Target Size")
+        w.v_codec.setCurrentText("AV1")
+        w.update_codec_ui("AV1")
+        assert w.chk_hw.isChecked()  # HW is the default when supported
+        w.chk_2pass.setChecked(True)  # 2-pass is software-only
+        assert not w.chk_hw.isEnabled()
+        w.chk_2pass.setChecked(False)
+        assert w.chk_hw.isEnabled()
+
+    def test_probe_refresh_does_not_stomp_user_2pass_choice(self, window):
+        # regression: async probe completion silently replaced an explicit
+        # 2-pass selection with HW + 1-pass
+        w = window
+        self._no_hw_av1(w)
+        w.mode_combo.setCurrentText("Target Size")
+        w.v_codec.setCurrentText("AV1")
+        w.update_codec_ui("AV1")
+        w.chk_2pass.setChecked(False)
+        w.chk_2pass.click()  # real user interaction ticks 2-pass
+        assert w.chk_2pass.isChecked()
+        self._hw_av1(w)  # device turns out to support HW AV1
+        w.update_codec_ui("AV1")  # refresh, as probe completion would
+        assert w.chk_2pass.isChecked()
+        assert not w.chk_hw.isChecked()
+        assert not w.chk_hw.isEnabled()
+
+    def test_probe_refresh_applies_defaults_when_untouched(self, window):
+        # without user interaction the HW default must still apply once the
+        # device's capabilities are known
+        w = window
+        self._no_hw_av1(w)
+        w.mode_combo.setCurrentText("Target Size")
+        w.v_codec.setCurrentText("AV1")
+        w.update_codec_ui("AV1")
+        assert w.chk_2pass.isChecked()
+        self._hw_av1(w)
+        w.update_codec_ui("AV1")
+        assert w.chk_hw.isChecked()
+        assert not w.chk_2pass.isChecked()
+
+    def test_codec_change_resets_to_defaults(self, window):
+        w = window
+        self._hw_av1(w)
+        w.mode_combo.setCurrentText("Target Size")
+        w.v_codec.setCurrentText("AV1")
+        w.update_codec_ui("AV1")
+        w.chk_2pass.setChecked(False)
+        w.chk_2pass.click()  # user ticks 2-pass on AV1
+        w.v_codec.setCurrentText("H.264")  # new codec -> fresh defaults
+        w.update_codec_ui("H.264")
+        assert w.chk_hw.isChecked()
+        assert not w.chk_2pass.isChecked()
+
 
 class TestProbingLifecycle:
     def test_probe_timeout_unblocks_ui(self, window):
@@ -314,9 +410,10 @@ class TestProbingLifecycle:
         assert w.hw_device_prober is not None
         assert w._device_probe_started is True
 
-    def test_retired_prober_kept_referenced_until_finished(self, window, qapp):
-        # regression: replaced probers lost their last Python reference while
-        # still running, which can crash the process (QThread destroyed mid-run)
+    def test_retired_thread_kept_referenced_until_finished(self, window, qapp):
+        # regression: replaced probers/workers lost their last Python reference
+        # while still running, which can crash the process (QThread destroyed
+        # mid-run)
         import time
         w = window
 
@@ -326,14 +423,14 @@ class TestProbingLifecycle:
 
         old = Sleepy()
         old.start()
-        w._retire_prober(old)
-        assert old in w._retired_probers
+        w._retire_thread(old)
+        assert old in w._retired_threads
         assert old.wait(2000)
         deadline = time.time() + 2
-        while old in w._retired_probers and time.time() < deadline:
+        while old in w._retired_threads and time.time() < deadline:
             qapp.processEvents()
             time.sleep(0.01)
-        assert old not in w._retired_probers
+        assert old not in w._retired_threads
 
     def test_generation_guard_drops_stale_results(self, window):
         w = window
@@ -350,3 +447,52 @@ class TestProbingLifecycle:
         w.detect_devices()
         assert w.device_combo.count() == 1
         assert w.device_combo.currentText() == "/dev/dri/renderD128"
+
+    def test_startup_without_render_devices_does_not_crash(self, m, qapp, monkeypatch):
+        # regression: detect_devices() logged before self.log was created, so
+        # machines without /dev/dri render nodes crashed during __init__
+        monkeypatch.setattr(m.MainWindow, "check_sw_encoders", lambda self: None)
+        monkeypatch.setattr(m.MainWindow, "check_audio_encoders", lambda self: None)
+        monkeypatch.setattr(m.MainWindow, "initial_probe", lambda self: None)
+        monkeypatch.setattr(m.MainWindow, "inhibit_sleep", lambda self: None)
+        monkeypatch.setattr(m.MainWindow, "release_sleep", lambda self: None)
+        monkeypatch.setattr(m.glob, "glob", lambda pattern: [] if pattern.startswith("/dev/dri") else [])
+        w = m.MainWindow()
+        try:
+            assert w.device_combo.count() == 1
+            assert w.device_combo.currentText() == "/dev/dri/renderD128"
+        finally:
+            w.close()
+            w.deleteLater()
+            qapp.processEvents()
+
+    def test_probe_cache_skips_rerunning_probes(self, window, m, monkeypatch):
+        # startup probe optimization: a previously probed (ffmpeg, device)
+        # pair is restored from cache instead of re-spawning prober threads
+        w = window
+        started = []
+        for cls in (m.HWDeviceProber, m.HWDecoderChecker, m.VulkanDeviceProber):
+            monkeypatch.setattr(cls, "start", lambda self: started.append(1))
+
+        w._vulkan_probed = False
+        w.probe_device("/dev/dri/renderD129")
+        assert started  # cold path schedules real probers
+
+        enc_caps = {"av1": True, "h264": True, "hevc": True, "vp9": True,
+                    "gpu_vendor": "amd", "encoder_options": {}}
+        dec_caps = {"h264": True, "hevc": True, "vp8": True, "vp9": True,
+                    "av1": True, "mpeg2video": True, "gpu_vendor": "amd"}
+        w._probe_cache[('hw_enc', 'ffmpeg', '/dev/dri/renderD129')] = enc_caps
+        w._probe_cache[('hw_dec', 'ffmpeg', '/dev/dri/renderD129')] = dec_caps
+        w._probe_cache[('vulkan', 'ffmpeg')] = (True, {"vulkan_available": True,
+                                                       "prores_vulkan": False})
+
+        w.device_capabilities.clear()
+        w.hw_decoder_capabilities.clear()
+        w._vulkan_probed = False
+        started.clear()
+        w.probe_device("/dev/dri/renderD129")
+        assert started == []  # nothing re-spawned
+        assert w.device_capabilities["/dev/dri/renderD129"] == enc_caps
+        assert w.hw_decoder_capabilities["/dev/dri/renderD129"] == dec_caps
+        assert w.vulkan_available is True

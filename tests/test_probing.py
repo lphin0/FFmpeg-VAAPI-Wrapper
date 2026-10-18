@@ -56,6 +56,22 @@ class TestProbingCoordinator:
         c = m.ProbingCoordinator()
         assert c.check_timeout() is False
 
+    def test_straggler_after_timeout_does_not_reflush_stale_logs(self, m):
+        # regression: check_timeout() left completed_logs populated, so a
+        # prober finishing after the timeout re-flushed every earlier log
+        c = m.ProbingCoordinator()
+        flushed = []
+        c.reset(["sw_encoders", "vulkan"])
+        c.submit_logs("sw_encoders", "s", flushed.append)  # vulkan still pending
+        c.start_time = time.time() - 999
+        assert c.check_timeout() is True
+        assert flushed == [["s", "vulkan: TIMED OUT"]]
+        # straggler arrives late: only its own logs are delivered
+        assert c.submit_logs("vulkan", "late v", flushed.append) is True
+        assert flushed == [["s", "vulkan: TIMED OUT"], ["late v"]]
+        # and the closed cycle cannot time out again
+        assert c.check_timeout() is False
+
 
 class TestHWDeviceProberWiring:
     def test_default_caps_contain_all_keys(self, m):

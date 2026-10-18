@@ -515,13 +515,38 @@ class TestBuildVfChain:
         assert "hwupload" in vf
         assert "Vulkan" not in name
 
-    def test_av1_hw_uses_cpu_path_with_10bit(self, m):
-        # AV1 encoding always uses the CPU-decode path (special 10-bit handling)
+    def test_av1_hw_uses_universal_path_with_p010le(self, m):
+        # regression: AV1 hw encodes always fell back to CPU decode + hwupload
+        # even when the source was HW-decodable and scaling could stay on GPU
         extras, vf, name = m.build_vf_chain(**{
-            **VF_KWARGS, "can_hw_decode": True, "is_av1": True, "pix_fmt": "yuv420p10le"})
+            **VF_KWARGS, "can_hw_decode": True, "is_av1": True, "pix_fmt": "p010le"})
+        assert "-hwaccel" in extras and "vaapi" in extras
+        assert vf == ["scale_vaapi=format=p010le"]
+        assert "Universal" in name
+
+    def test_av1_hw_universal_path_scales_on_gpu(self, m):
+        extras, vf, name = m.build_vf_chain(**{
+            **VF_KWARGS, "can_hw_decode": True, "is_av1": True, "pix_fmt": "p010le",
+            "target_w": 1280, "target_h": 720})
+        assert vf == ["scale_vaapi=w=1280:h=720:format=p010le"]
+
+    def test_av1_hw_software_scaler_stays_on_cpu(self, m):
+        # A software scaler (Lanczos/Mitchell) still needs CPU frames
+        extras, vf, name = m.build_vf_chain(**{
+            **VF_KWARGS, "can_hw_decode": True, "is_av1": True, "pix_fmt": "p010le",
+            "algo": "Lanczos HQ", "target_w": 1280, "target_h": 720})
         assert "-hwaccel" not in extras
-        assert "format=yuv420p10le" in vf
-        assert "hwupload" in vf
+        assert vf == ["scale=1280:720:flags=lanczos", "format=p010le", "hwupload"]
+        assert "CPU Decode" in name
+
+    def test_av1_hw_non_decodable_uploads_p010le(self, m):
+        # 10-bit VAAPI surfaces are p010le (yuv420p10le is software-side only).
+        # Without HW decode the frames upload first, then scale on the GPU -
+        # which requires the GPU-side format to be a valid surface format.
+        extras, vf, name = m.build_vf_chain(**{
+            **VF_KWARGS, "is_av1": True, "pix_fmt": "p010le", "target_w": 1280, "target_h": 720})
+        assert "-hwaccel" not in extras
+        assert vf == ["format=p010le", "hwupload", "scale_vaapi=w=1280:h=720:format=p010le"]
         assert "CPU Decode" in name
 
 
@@ -642,28 +667,29 @@ class TestPassthroughAudioBudget:
 
 class TestShouldRun2Pass:
     def test_explicit_2pass_long_video(self, m):
-        assert m.should_run_2pass("size", False, "libx264", False, True, False) is True
+        assert m.should_run_2pass("size", False, "libx264", True, False) is True
 
-    def test_explicit_2pass_short_video_skipped(self, m):
-        # Short clips use single-pass VBR with a tight maxrate instead
-        assert m.should_run_2pass("size", False, "libx264", True, True, False) is False
+    def test_explicit_2pass_short_video_honored(self, m):
+        # regression: short clips used to silently skip a requested 2-pass,
+        # so the checkbox "did nothing" and every short clip was 1-pass
+        assert m.should_run_2pass("size", False, "libx264", True, False) is True
+        assert m.should_run_2pass("size", False, "libsvtav1", True, False) is True
 
-    def test_forced_av1_overrides_short_video(self, m):
-        # regression: auto-scale forced 2-pass but `not is_short_video` gated
-        # the whole expression, so short clips silently stayed single-pass
-        assert m.should_run_2pass("size", False, "libsvtav1", True, False, True) is True
+    def test_forced_av1_always_two_pass(self, m):
+        assert m.should_run_2pass("size", False, "libsvtav1", False, True) is True
+        assert m.should_run_2pass("size", False, "libsvtav1", True, True) is True
 
     def test_not_requested(self, m):
-        assert m.should_run_2pass("size", False, "libx264", False, False, False) is False
+        assert m.should_run_2pass("size", False, "libx264", False, False) is False
 
     def test_never_for_hardware(self, m):
-        assert m.should_run_2pass("size", True, "hevc_vaapi", False, True, True) is False
+        assert m.should_run_2pass("size", True, "hevc_vaapi", True, True) is False
 
     def test_never_for_passthrough(self, m):
-        assert m.should_run_2pass("size", False, "copy", False, True, False) is False
+        assert m.should_run_2pass("size", False, "copy", True, True) is False
 
     def test_never_for_quality_mode(self, m):
-        assert m.should_run_2pass("quality", False, "libx264", False, True, False) is False
+        assert m.should_run_2pass("quality", False, "libx264", True, True) is False
 
 
 class TestVaapiDeviceReuse:
